@@ -1,4 +1,4 @@
-"""Compile single-token Qwen3.5/3.6 MoE decode without changing weights."""
+"""Compile Qwen3.5/3.6 decode and short MoE verification without changing weights."""
 
 import mlx.core as mx
 from mlx_lm.models.cache import ArraysCache
@@ -14,7 +14,8 @@ def _single_token(x):
 
 class _CompiledMoE(Qwen3NextSparseMoeBlock):
     def __call__(self, x):
-        if not self.training and self.sharding_group is None and _single_token(x):
+        if (not self.training and self.sharding_group is None and x.ndim == 3
+                and x.shape[0] == 1 and x.shape[1] in (1, 2, 3)):
             self._decode_calls += 1
             return self._decode(x)
         return Qwen3NextSparseMoeBlock.__call__(self, x)

@@ -177,7 +177,7 @@ class DownModelTests(unittest.TestCase):
                 with patch("mtplx.local_optimizations.qwen35.down_kernel.down", wraps=down) as kernel:
                     actual = module(x, indices, sorted_indices)
                     self.assert_exact(actual, expected)
-                    self.assertEqual(kernel.call_count, int(i == 0))
+                    self.assertEqual(kernel.call_count, int(i in (0, 1)))
 
     def test_install_validation_is_atomic(self):
         model = half_model()

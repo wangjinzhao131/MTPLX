@@ -3040,6 +3040,13 @@ def forward_with_gdn_capture(
         and context_len >= max(0, layer_eval_threshold)
     )
 
+    local_capture = getattr(model, "_local_mtp_capture", None)
+    if local_capture is not None and not layer_eval_enabled:
+        result = local_capture(inputs, cache, return_hidden=return_hidden,
+                               hidden_variant=hidden_variant, capture_backend=backend)
+        if result is not NotImplemented:
+            return result
+
     for layer_idx, (layer, layer_cache) in enumerate(zip(inner.layers, cache)):
         mask = ssm_mask if layer.is_linear else fa_mask
         normed = layer.input_layernorm(hidden_states)

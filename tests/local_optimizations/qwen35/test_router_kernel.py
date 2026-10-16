@@ -114,7 +114,7 @@ class RouterKernelTests(unittest.TestCase):
                 for session, (ref_cache, opt_cache) in enumerate(sessions):
                     prompt = mx.array([[1, 2, 3] + ([4] if session else [])])
                     self.assert_exact(candidate(prompt, opt_cache), baseline(prompt, ref_cache))
-                self.assertEqual(routed.call_count, 0)
+                self.assertEqual(routed.call_count, len(candidate.layers))
                 tokens = [mx.array([[5]]), mx.array([[6]])]
                 for _ in range(6):
                     for session, (ref_cache, opt_cache) in enumerate(sessions):
@@ -126,9 +126,10 @@ class RouterKernelTests(unittest.TestCase):
                             for ref_state, opt_state in zip(ref_entry.state, opt_entry.state):
                                 self.assert_exact(opt_state, ref_state)
                         tokens[session] = mx.argmax(expected[:, -1:, :], -1)
-                self.assertEqual(routed.call_count, len(candidate.layers))
+                self.assertEqual(routed.call_count, 2 * len(candidate.layers))
             for layer in candidate.layers:
-                self.assertEqual((layer if layer.is_linear else layer.mlp)._decode_calls, 12)
+                self.assertEqual((layer if layer.is_linear else layer.mlp)._decode_calls,
+                                 12 if layer.is_linear else 13)
             undo.pop()()
             self.assertTrue(all(type(layer.mlp) is _RoutedMoE for layer in candidate.layers))
             ref_cache, opt_cache = sessions[0]

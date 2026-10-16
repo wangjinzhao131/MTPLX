@@ -39,7 +39,7 @@ class ProfileTests(unittest.TestCase):
                 local_optimizations.resolve(dense)
 
     def test_loader_installs_before_injection_and_skips_upstream_fusions(self):
-        for name, factory in (("qwen35-ar", make_full_stack_model), ("qwen27-mtp", make_dense)):
+        for name, factory in (("qwen35-ar", make_full_stack_model), ("qwen35-mtp", make_full_stack_model), ("qwen27-mtp", make_dense)):
             model = factory()
             config = {"model_type": model.args.model_type, "text_config": model.args.text_config}
             def inject(loaded, *_args):
@@ -54,8 +54,8 @@ class ProfileTests(unittest.TestCase):
                     patch("mtplx.attention_split.configure_split_full_attention") as upstream:
                 loaded = runtime.load(Path(directory), mtp=True)
                 self.assertEqual(loaded.local_optimization, name)
-                self.assertEqual(loaded.mtp_enabled, name == "qwen27-mtp")
-                self.assertEqual(injection.call_count, int(name == "qwen27-mtp"))
+                self.assertEqual(loaded.mtp_enabled, name != "qwen35-ar")
+                self.assertEqual(injection.call_count, int(name != "qwen35-ar"))
                 upstream.assert_not_called()
                 cache = model.make_cache()
                 out = loaded.forward_ar(mx.array([[1, 2, 3]]), cache)

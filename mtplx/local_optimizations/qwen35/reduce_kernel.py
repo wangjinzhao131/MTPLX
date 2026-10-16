@@ -17,7 +17,8 @@ _SOURCE = r"""
     const uint slot = simdgroup_index_in_threadgroup;
     const uint lane = thread_index_in_simdgroup;
     const uint row = threadgroup_position_in_grid.x * 4;
-    const uint expert = indices[slot];
+    const uint token = threadgroup_position_in_grid.y;
+    const uint expert = indices[token * 8 + slot];
     thread float result[4] = {0};
     if (expert < E) {
         constexpr int ROW_BYTES = 512 * 6 / 8;
@@ -27,7 +28,7 @@ _SOURCE = r"""
                                    first * ROW_BYTES + lane * 6;
         const device half* ss = scales + first * GROUPS + lane / 8;
         const device half* bs = biases + first * GROUPS + lane / 8;
-        const device half* xs = x + slot * 512 + lane * 8;
+        const device half* xs = x + (token * 8 + slot) * 512 + lane * 8;
         thread float values[8];
         for (int k = 0; k < 512; k += 256) {
             float sum = load_vector6<false>(xs, values);
@@ -46,7 +47,7 @@ _SOURCE = r"""
         float value = simd_sum(result[r]);
         if (lane == 0) {
             half projected = expert < E ? half(value) : half(NAN);
-            half product = projected * scores[slot];
+            half product = projected * scores[token * 8 + slot];
             partials[slot * 4 + r] = product + half(0);
         }
     }
@@ -55,7 +56,7 @@ _SOURCE = r"""
     if (slot == 0 && lane < 4) {
         half total = partials[lane];
         for (int j = 1; j < 8; j++) total = partials[j * 4 + lane] + total;
-        y[row + lane] = total;
+        y[token * N + row + lane] = total;
     }
 """
 
@@ -71,17 +72,18 @@ def _kernel():
 
 
 def weighted_down(x, indices, scores, weight, scales, biases):
-    """Return [1, 1, N], preserving projection/product/sum FP16 rounding.
+    """Return [1, S, N] for S=1..3, preserving projection/product/sum FP16 rounding.
 
     Invalid expert IDs produce NaNs without reading their weights.
     # shortcut: eight experts, FP16, K512, four-row tiles; profile before extending.
     """
-    if x.shape != (1, 1, 8, 1, 512) or x.dtype != mx.float16:
-        raise ValueError("weighted down requires [1, 1, 8, 1, 512] float16 activations")
-    if indices.shape != (1, 1, 8) or indices.dtype != mx.uint32:
-        raise ValueError("weighted down requires [1, 1, 8] uint32 expert indices")
-    if scores.shape != (1, 1, 8) or scores.dtype != mx.float16:
-        raise ValueError("weighted down requires [1, 1, 8] float16 routing scores")
+    if (x.ndim != 5 or x.shape[0] != 1 or x.shape[1] not in (1, 2, 3)
+            or x.shape[2:] != (8, 1, 512) or x.dtype != mx.float16):
+        raise ValueError("weighted down requires [1, S, 8, 1, 512], S=1..3, float16 activations")
+    if indices.shape != (*x.shape[:2], 8) or indices.dtype != mx.uint32:
+        raise ValueError("weighted down requires [1, S, 8] uint32 expert indices")
+    if scores.shape != indices.shape or scores.dtype != mx.float16:
+        raise ValueError("weighted down requires [1, S, 8] float16 routing scores")
     if (weight.ndim != 3 or weight.dtype != mx.uint32 or weight.shape[0] < 1
             or weight.shape[-1] != 96 or weight.shape[1] < 8 or weight.shape[1] % 8):
         raise ValueError("weighted down requires [E, N, 96] uint32 weights and N divisible by8")
@@ -91,6 +93,6 @@ def weighted_down(x, indices, scores, weight, scales, biases):
         raise ValueError("weighted down requires matching group64 float16 scales and biases")
     return _kernel()(
         inputs=[x, indices, scores, weight, scales, biases],
-        template=[("N", n), ("E", e)], grid=(n // 4 * 256, 1, 1),
-        threadgroup=(256, 1, 1), output_shapes=[(1, 1, n)], output_dtypes=[mx.float16],
+        template=[("N", n), ("E", e)], grid=(n // 4 * 256, x.shape[1], 1),
+        threadgroup=(256, 1, 1), output_shapes=[(*x.shape[:2], n)], output_dtypes=[mx.float16],
     )[0]

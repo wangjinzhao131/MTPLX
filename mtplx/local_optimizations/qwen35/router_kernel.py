@@ -11,6 +11,7 @@ from .moe_kernel import _FusedSwitchGLU
 
 
 _SOURCE = """
+    const uint token = threadgroup_position_in_grid.y;
     const uint tid = thread_position_in_threadgroup.x;
     const uint lane = thread_index_in_simdgroup;
     const uint simd = simdgroup_index_in_threadgroup;
@@ -20,7 +21,7 @@ _SOURCE = """
     float values[4];
     float maximum = -INFINITY;
     for (uint i = 0; i < 4; ++i) {
-        values[i] = float(logits[4 * tid + i]);
+        values[i] = float(logits[token * 256 + 4 * tid + i]);
         maximum = maximum < values[i] ? values[i] : maximum;
     }
     if (simd == 0) {
@@ -58,8 +59,8 @@ _SOURCE = """
     // Any NaN/positive infinity (or all negative infinities) makes every probability NaN.
     if (!isfinite(normalizer)) {
         if (lane < 8) {
-            indices[lane] = 248 + lane;
-            scores[lane] = T(NAN);
+            indices[token * 8 + lane] = 248 + lane;
+            scores[token * 8 + lane] = T(NAN);
         }
         return;
     }
@@ -86,8 +87,8 @@ _SOURCE = """
     T total = T(0);
     for (uint i = 0; i < 8; ++i) total = selected[i] + total;
     if (lane < 8) {
-        indices[lane] = selected_indices[lane];
-        scores[lane] = selected[lane] / total;
+        indices[token * 8 + lane] = selected_indices[lane];
+        scores[token * 8 + lane] = selected[lane] / total;
     }
 """
 
@@ -100,17 +101,18 @@ _kernel = mx.fast.metal_kernel(
 
 def route(logits):
     """Return stock-ordered uint32 indices and normalized probabilities."""
-    if logits.shape != (1, 1, 256) or logits.dtype not in (mx.float16, mx.float32):
-        raise ValueError("router kernel requires FP16/FP32 logits of shape (1,1,256)")
+    if (logits.ndim != 3 or logits.shape[0] != 1 or logits.shape[1] not in (1, 2, 3)
+            or logits.shape[2] != 256 or logits.dtype not in (mx.float16, mx.float32)):
+        raise ValueError("router kernel requires FP16/FP32 logits of shape (1,S,256), S=1..3")
     return _kernel(inputs=[logits], template=[("T", logits.dtype)],
-                   grid=(64, 1, 1), threadgroup=(64, 1, 1),
-                   output_shapes=[(1, 1, 8), (1, 1, 8)], output_dtypes=[mx.uint32, logits.dtype])
+                   grid=(64, logits.shape[1], 1), threadgroup=(64, 1, 1),
+                   output_shapes=[(*logits.shape[:2], 8)] * 2, output_dtypes=[mx.uint32, logits.dtype])
 
 
 def moe_forward(block, x):
-    """Stateless native MoE forward with fused routing for single-token decode."""
-    # shortcut: specialized B1/S1/top8/256 router; retain native paths for other shapes.
-    if (block.training or block.sharding_group is not None or x.ndim != 3 or x.shape[:2] != (1, 1)
+    """Stateless native MoE forward with fused routing for decode and short MTP verification."""
+    # shortcut: specialized B1/S<=3/top8/256 router; retain native paths for other shapes.
+    if (block.training or block.sharding_group is not None or x.ndim != 3 or (x.shape[0] != 1 or x.shape[1] not in (1, 2, 3))
             or block.num_experts != 256 or block.top_k != 8 or not block.norm_topk_prob
             or x.dtype not in (mx.float16, mx.float32)):
         return Qwen3NextSparseMoeBlock.__call__(block, x)
@@ -132,7 +134,7 @@ class _RoutedMoE(Qwen3NextSparseMoeBlock):
 def apply(model):
     """Install after projection/GDN/MoE fusion, before opt.apply; undo in reverse.
 
-    Prefill, batches and training retain native routing. Undo is idempotent.
+    Inputs longer than three tokens, batches and training retain native routing. Undo is idempotent.
     """
     modules = [layer.mlp for layer in model.layers]
     if not modules or any(type(module) is not Qwen3NextSparseMoeBlock for module in modules):

@@ -12,6 +12,7 @@ import mlx.nn as nn
 from mlx.utils import tree_flatten
 from mlx_lm.models.cache import ArraysCache
 
+from mtplx.local_optimizations import capture as common
 from mtplx.local_optimizations.qwen27 import engine
 from mtplx.local_optimizations.qwen27 import gdn_compile as candidate
 from .test_decode_fusion import make_model
@@ -35,7 +36,7 @@ class GDNCompileTests(unittest.TestCase):
     def setUp(self):
         mx.random.seed(499)
         # Fixed stock semantics; the environment-switch test changes them later.
-        environment = {name: "0" for name in candidate._ENV_BRANCHES}
+        environment = {name: "0" for name in common._ENV_BRANCHES}
         environment.update(MTPLX_CAPTURE_CUSTOM_KERNEL="stock",
                            MTPLX_CAPTURE_CONTIGUOUS_GDN_STATE="0")
         self.environment = patch.dict(os.environ, environment)
@@ -196,20 +197,20 @@ class GDNCompileTests(unittest.TestCase):
             original = self.capture.gdn_forward_with_capture
             out, _ = original(gdn, x, cache=cache, capture_backend="stock")
             mx.eval(out, cache.state)
-            for key in candidate._ENV_BRANCHES:
+            for key in common._ENV_BRANCHES:
                 with patch.dict(os.environ, {key: "1"}):
-                    self.assertFalse(candidate._ready(gdn, x, None, cache, "stock", self.capture))
+                    self.assertFalse(common._ready(gdn, x, None, cache, "stock", self.capture))
             with patch.object(self.capture, "_linear_gated_delta_kernel", None):
-                self.assertFalse(candidate._ready(gdn, x, None, cache, "stock", self.capture))
+                self.assertFalse(common._ready(gdn, x, None, cache, "stock", self.capture))
             with patch.dict(os.environ, {"MTPLX_CAPTURE_CUSTOM_KERNEL": "linear-gdn"}):
-                self.assertFalse(candidate._ready(gdn, x, None, cache, None, self.capture))
-            self.assertFalse(candidate._ready(gdn, x, None, cache, "linear-gdn", self.capture))
+                self.assertFalse(common._ready(gdn, x, None, cache, None, self.capture))
+            self.assertFalse(common._ready(gdn, x, None, cache, "linear-gdn", self.capture))
             for attr in ("lengths", "left_padding"):
                 setattr(cache, attr, mx.array([3]))
-                self.assertFalse(candidate._ready(gdn, x, None, cache, "stock", self.capture))
+                self.assertFalse(common._ready(gdn, x, None, cache, "stock", self.capture))
                 setattr(cache, attr, None)
             gdn.out_proj.train()
-            self.assertFalse(candidate._ready(gdn, x, None, cache, "stock", self.capture))
+            self.assertFalse(common._ready(gdn, x, None, cache, "stock", self.capture))
             gdn.out_proj.eval()
             # Cache leaf policy is dynamic Python behavior, not a frozen trace.
             with patch.dict(os.environ, {"MTPLX_CAPTURE_CONTIGUOUS_GDN_STATE": "1"}):
@@ -237,7 +238,7 @@ class GDNCompileTests(unittest.TestCase):
             self.assertIs(self.capture._gdn_forward_with_capture, original)
             self.assertFalse(hasattr(gdn, "_compiled_capture"))
         model = make_model()
-        with patch.object(candidate, "_compile_capture", side_effect=RuntimeError("test compile setup")):
+        with patch.object(common, "_compile_capture", side_effect=RuntimeError("test compile setup")):
             with self.assertRaisesRegex(RuntimeError, "test compile setup"):
                 candidate.apply(model)
         self.assertIs(self.capture._gdn_forward_with_capture, original)

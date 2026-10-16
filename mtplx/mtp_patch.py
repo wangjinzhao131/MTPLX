@@ -1121,6 +1121,15 @@ def inject_mtp_support(
                 logits_keep: int | None = None,
                 **kwargs,
             ):
+                local_forward = getattr(self, "_local_mtp_target_forward", None)
+                if local_forward is not None:
+                    result = local_forward(
+                        inputs, cache=cache, return_hidden=return_hidden,
+                        input_embeddings=input_embeddings, hidden_variant=hidden_variant,
+                        emit_logits=emit_logits, logits_keep=logits_keep, **kwargs,
+                    )
+                    if result is not NotImplemented:
+                        return result
                 return self.language_model(
                     inputs,
                     cache=cache,

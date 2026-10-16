@@ -101,7 +101,7 @@ _SOURCE = r"""
                                first * ROW_BYTES + lane * 6;
     const device half* ss = scales + first * GROUPS + lane / 8;
     const device half* bs = biases + first * GROUPS + lane / 8;
-    const device half* xs = x + lane * 8;
+    const device half* xs = x + (slot / TOPK) * K + lane * 8;
     thread float values[8];
     thread float result[2 * PAIRS] = {0};
     for (int k = 0; k < K; k += 256) {
@@ -156,7 +156,7 @@ def _layout(weight, scales, biases, k):
 
 
 def gate_up(x, indices, weight, scales, biases, *, compact=False, pairs_per_simd=2, simdgroups=2):
-    """Return [1, 1, selected experts, 1, N] for one FP16 decode token.
+    """Return [1, S, selected experts, 1, N] for S=1..3 FP16 tokens.
 
     Inputs must be affine6/group64 weights with gate rows preceding up rows.
     An out-of-range uint32 expert index produces NaNs without accessing weights.
@@ -164,30 +164,31 @@ def gate_up(x, indices, weight, scales, biases, *, compact=False, pairs_per_simd
     dot order differs from MLX. The default keeps the native dot expression.
     pairs_per_simd and simdgroups expose row/occupancy tuning; model decode uses
     the measured 4-pair/4-SIMDgroup tile when its output width permits it.
-    # shortcut: B=1/S=1, FP16, K multiple256 and N multiple4; extend only after benchmarks.
+    # shortcut: B=1/S<=3, FP16, K multiple256 and N multiple4; extend only after benchmarks.
     """
-    if x.ndim != 3 or x.shape[:2] != (1, 1) or x.dtype != mx.float16:
-        raise ValueError("gate_up requires one [1, 1, K] float16 decode token")
-    if indices.ndim != 3 or indices.shape[:2] != (1, 1) or indices.dtype != mx.uint32 or indices.size < 1:
-        raise ValueError("gate_up requires nonempty [1, 1, selected experts] uint32 indices")
+    if (x.ndim != 3 or x.shape[0] != 1 or x.shape[1] not in (1, 2, 3)
+            or x.dtype != mx.float16):
+        raise ValueError("gate_up requires [1, S, K], S=1..3, float16 decode token")
+    if indices.ndim != 3 or indices.shape[:2] != x.shape[:2] or indices.dtype != mx.uint32 or indices.size < 1:
+        raise ValueError("gate_up requires nonempty [1, S, selected experts] uint32 indices")
     k = x.shape[-1]
     n = _layout(weight, scales, biases, k)
     if pairs_per_simd not in (1, 2, 4, 8) or simdgroups not in (2, 4) or n % (pairs_per_simd * simdgroups):
         raise ValueError("gate_up requires pairs_per_simd in 1/2/4/8, simdgroups in 2/4, and N divisible by their product")
     return _kernel()(
         inputs=[x, indices, weight, scales, biases],
-        template=[("K", k), ("N", n), ("E", weight.shape[0]), ("COMPACT", compact),
+        template=[("K", k), ("TOPK", indices.shape[-1]), ("N", n), ("E", weight.shape[0]), ("COMPACT", compact),
                   ("PAIRS", pairs_per_simd), ("SIMDGROUPS", simdgroups)],
         grid=(n // pairs_per_simd * 32, indices.size, 1), threadgroup=(32 * simdgroups, 1, 1),
-        output_shapes=[(1, 1, indices.size, 1, n)], output_dtypes=[mx.float16],
+        output_shapes=[(*indices.shape, 1, n)], output_dtypes=[mx.float16],
     )[0]
 
 
 class _FusedSwitchGLU(SwitchGLU):
     def _decode_ready(self, x, indices):
         return (not self.training and not self.gate_proj.training and not self.up_proj.training
-                and x.ndim == 3 and x.shape[:2] == (1, 1) and x.dtype == mx.float16
-                and indices.ndim == 3 and indices.shape[:2] == (1, 1)
+                and x.ndim == 3 and x.shape[0] == 1 and x.shape[1] in (1, 2, 3) and x.dtype == mx.float16
+                and indices.ndim == 3 and indices.shape[:2] == x.shape[:2]
                 and self.gate_proj.output_dims % 16 == 0
                 and indices.dtype == mx.uint32 and 0 < indices.size < 64)
 
@@ -211,7 +212,7 @@ class _FusedSwitchGLU(SwitchGLU):
         down = self.down_proj
         if (self._decode_ready(x, indices) and type(down) is _DownProjection
                 and not down.training and self.gate_proj.output_dims == 512
-                and indices.shape == (1, 1, 8) and scores.shape == (1, 1, 8)
+                and indices.shape == (*x.shape[:2], 8) and scores.shape == indices.shape
                 and scores.dtype == mx.float16):
             from .reduce_kernel import weighted_down
 
@@ -224,7 +225,7 @@ def apply(model):
     """Install native-qdot6 gate/up + SwiGLU after fusion, before compilation.
 
     Reuse fusion's packed buffers and preserve every parameter name and array.
-    Multi-token, batched and training calls retain SwitchGLU's original path.
+    Longer inputs, batches and training retain SwitchGLU's original path.
     A one-token initial prompt also uses the kernel. Undo before changing weights
     or undoing projection fusion; the returned undo is idempotent.
     """

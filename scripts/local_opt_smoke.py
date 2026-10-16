@@ -12,10 +12,13 @@ def main():
     parser.add_argument("model", type=Path)
     parser.add_argument("--mode", choices=("ar", "mtp"), default="ar")
     parser.add_argument("--tokens", type=int, default=128)
+    parser.add_argument("--depth", type=int, default=1)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     if args.tokens < 2:
         parser.error("--tokens must be at least 2")
+    if args.depth < 1:
+        parser.error("--depth must be at least 1")
 
     import mlx.core as mx
     from mtplx.runtime import load
@@ -38,7 +41,7 @@ def main():
                       repetition_stop=False, loop_guard=False)
         with prefill_chunk_size_override(2048):
             if args.mode == "mtp":
-                out = generate_mtpk(rt, ids, speculative_depth=1,
+                out = generate_mtpk(rt, ids, speculative_depth=args.depth,
                     verify_strategy="capture_commit", verify_core="stock", draft_core="stock",
                     mtp_cache_policy="persistent", mtp_history_policy="committed", **kwargs)
             else:
@@ -49,18 +52,24 @@ def main():
         stats = out.stats.to_dict()
         return dict(prompt_tokens=len(ids), tokens=out.tokens, finish_reason=out.finish_reason,
                     prefill_seconds=stats["prompt_eval_time_s"], decode_seconds=stats["decode_elapsed_s"],
-                    decode_tps=stats["decode_tok_s"])
+                    decode_tps=stats["decode_tok_s"],
+                    speculative={k: v for k, v in stats.items()
+                                 if any(term in k for term in ("accept", "draft", "verify", "mtp"))})
 
     generate("Count from one to twenty.", 16)
     rows = [generate(prompt, args.tokens) for prompt in prompts]
     counters = {"island_calls": getattr(rt.model, "_island_calls", 0),
+                "capture_island_calls": getattr(rt.model, "_capture_island_calls", 0),
                 "capture_calls": sum(getattr(layer.linear_attn, "_capture_calls", 0)
                                      for layer in rt.model.layers if layer.is_linear)}
+    if rt.local_optimization == "qwen35-mtp" and args.mode == "mtp":
+        assert counters["capture_island_calls"] > 0
     if rt.local_optimization == "qwen35-ar":
         assert counters["island_calls"] > 0
-    if rt.local_optimization == "qwen27-mtp" and args.mode == "mtp":
+    if rt.local_optimization in ("qwen27-mtp", "qwen35-mtp") and args.mode == "mtp":
         assert counters["capture_calls"] > 0
-    report = dict(profile=rt.local_optimization, mode=args.mode, rows=rows, counters=counters,
+    report = dict(profile=rt.local_optimization, mode=args.mode,
+                  depth=args.depth if args.mode == "mtp" else 0, rows=rows, counters=counters,
                   versions={name: version(name) for name in ("mlx", "mlx-lm", "transformers")},
                   config_sha256=hashlib.sha256((args.model/"config.json").read_bytes()).hexdigest(),
                   peak_memory_gb=mx.get_peak_memory()/1e9)

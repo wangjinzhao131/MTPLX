@@ -1,4 +1,6 @@
-"""Compile B1/S1 attention around the native KV update and actual-length SDPA.
+"""Compile attention around native KV updates and actual-length SDPA.
+
+The layer dispatcher specializes S1; MTP islands also reuse the S2/S3 parts.
 
 Install after opt.apply with final weights; undo in reverse before changing them.
 The two compiled calls have fixed shapes. The RoPE offset remains a tensor input.
@@ -18,20 +20,21 @@ def _compile_parts(layer):
     attention = layer.self_attn
 
     def before(x, offset):
+        length = x.shape[1]
         x = layer.input_layernorm(x)
         queries, gate = mx.split(
-            attention.q_proj(x).reshape(1, 1, attention.num_attention_heads, -1),
+            attention.q_proj(x).reshape(1, length, attention.num_attention_heads, -1),
             2, axis=-1)
-        gate = gate.reshape(1, 1, -1)
+        gate = gate.reshape(1, length, -1)
         keys, values = attention.k_proj(x), attention.v_proj(x)
         queries = attention.q_norm(queries).transpose(0, 2, 1, 3)
-        keys = attention.k_norm(keys.reshape(1, 1, attention.num_key_value_heads, -1))
+        keys = attention.k_norm(keys.reshape(1, length, attention.num_key_value_heads, -1))
         keys = keys.transpose(0, 2, 1, 3)
-        values = values.reshape(1, 1, attention.num_key_value_heads, -1).transpose(0, 2, 1, 3)
+        values = values.reshape(1, length, attention.num_key_value_heads, -1).transpose(0, 2, 1, 3)
         return attention.rope(queries, offset=offset), attention.rope(keys, offset=offset), values, gate
 
     def after(x, output, gate):
-        output = output.transpose(0, 2, 1, 3).reshape(1, 1, -1)
+        output = output.transpose(0, 2, 1, 3).reshape(1, x.shape[1], -1)
         h = x + attention.o_proj(output * mx.sigmoid(gate))
         return h + layer.mlp(layer.post_attention_layernorm(h))
 

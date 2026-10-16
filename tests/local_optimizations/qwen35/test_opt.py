@@ -67,7 +67,8 @@ class CompileDecodeTests(unittest.TestCase):
                     for ref_state, opt_state in zip(ref_entry.state, opt_entry.state):
                         self.assert_array_close(opt_state, ref_state)
         for layer in candidate.layers:
-            self.assertEqual((layer if layer.is_linear else layer.mlp)._decode_calls, 6)
+            self.assertEqual((layer if layer.is_linear else layer.mlp)._decode_calls,
+                             6 if layer.is_linear else 8)
         undo()
         undo()
         self.assertEqual(original_classes, [(type(layer), type(layer.mlp)) for layer in candidate.layers])

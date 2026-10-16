@@ -1,0 +1,71 @@
+{
+  "profile": "qwen35-mtp",
+  "context_window": 131072,
+  "depth": 1,
+  "prefill_chunk_size": 64,
+  "small_suffix_fused_max": 64,
+  "short_http_ar_equals_sse_mtp": true,
+  "short_mtp_drafted_tokens": 74,
+  "long_input": "8192 reference tokens of mixed repository code/prose plus chat template and OpenAI tool schema",
+  "long_input_turns": [
+    {
+      "turn": 1,
+      "usage": {
+        "prompt_tokens": 8859,
+        "completion_tokens": 128,
+        "total_tokens": 8987,
+        "prompt_tokens_details": {
+          "cached_tokens": 0
+        },
+        "completion_tokens_details": {
+          "reasoning_tokens": 0
+        }
+      },
+      "first_token_s": 29.109,
+      "stats": {
+        "local_optimization": "qwen35-mtp",
+        "generation_mode": "mtp",
+        "runtime_mtp_enabled": true,
+        "prefill_chunk_size": 64,
+        "prefill_chunks": 139,
+        "peak_memory_bytes": 31327436404,
+        "decode_tok_s": 60.53779431819791,
+        "new_prefill_tokens": 8859,
+        "drafted_tokens": 74,
+        "accepted_drafts": 53,
+        "rejected_drafts": 21,
+        "verify_calls": 74
+      }
+    },
+    {
+      "turn": 2,
+      "usage": {
+        "prompt_tokens": 9006,
+        "completion_tokens": 96,
+        "total_tokens": 9102,
+        "prompt_tokens_details": {
+          "cached_tokens": 8905
+        },
+        "completion_tokens_details": {
+          "reasoning_tokens": 0
+        }
+      },
+      "first_token_s": 0.484,
+      "stats": {
+        "local_optimization": "qwen35-mtp",
+        "generation_mode": "mtp",
+        "runtime_mtp_enabled": true,
+        "prefill_chunk_size": 64,
+        "prefill_chunks": 2,
+        "peak_memory_bytes": 31687466442,
+        "decode_tok_s": 58.737787623494235,
+        "new_prefill_tokens": 101,
+        "drafted_tokens": 58,
+        "accepted_drafts": 38,
+        "rejected_drafts": 20,
+        "verify_calls": 58
+      }
+    }
+  ],
+  "post_idle_peak_memory_bytes": 32088674338
+}

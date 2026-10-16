@@ -152,7 +152,7 @@ class ReduceModelTests(unittest.TestCase):
                 prompt = mx.array([[1, 2, 3] + ([4] if session else [])])
                 self.assert_exact(self.candidate(prompt, opt_cache), self.reference(prompt, ref_cache), "prefill")
                 self.assert_caches(opt_cache, ref_cache)
-            self.assertEqual(kernel.call_count, 0)
+            self.assertEqual(kernel.call_count, len(self.candidate.layers))
             tokens = [mx.array([[5]], dtype=mx.uint32), mx.array([[6]], dtype=mx.uint32)]
             for step in range(6):
                 for session, (ref_cache, opt_cache) in enumerate(sessions):
@@ -162,7 +162,7 @@ class ReduceModelTests(unittest.TestCase):
                     self.assert_exact(mx.argmax(actual, -1), mx.argmax(expected, -1), "greedy")
                     self.assert_caches(opt_cache, ref_cache)
                     tokens[session] = mx.argmax(expected[:, -1, :], -1)[:, None]
-            self.assertEqual(kernel.call_count, len(self.candidate.layers))
+            self.assertEqual(kernel.call_count, 2 * len(self.candidate.layers))
         self.assertEqual(self.candidate._island_calls, 12)
         self.assertEqual(self.candidate._island_traces, [1, 1])
         self.assertEqual(names, [name for name, _ in tree_flatten(self.candidate.parameters())])
@@ -201,7 +201,7 @@ class ReduceModelTests(unittest.TestCase):
                 expected = (switch(x, indices) * scores[..., None]).sum(axis=-2)
                 with patch("mtplx.local_optimizations.qwen35.reduce_kernel.weighted_down", wraps=weighted_down) as kernel:
                     self.assert_exact(switch.weighted(x, indices, scores), expected, "weighted fallback")
-                    self.assertEqual(kernel.call_count, int(position == 0))
+                    self.assertEqual(kernel.call_count, int(position in (0, 1)))
         switch.eval()
         # A native down projection is a supported fallback, including after undo.
         down_projection = switch.down_proj

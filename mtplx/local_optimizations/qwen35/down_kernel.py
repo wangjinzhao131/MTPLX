@@ -68,7 +68,7 @@ def _kernel():
 
 
 def down(x, indices, weight, scales, biases, *, results_per_simd=4, simdgroups=2):
-    """Return [1, 1, 8, 1, N] with one independent activation per expert slot.
+    """Return [1, S, 8, 1, N] with one independent activation per expert slot.
 
     The checkpoint has E=256, N=2048; smaller E/N also permit inexpensive
     numerical tests. Invalid expert IDs produce NaNs without reading weights.
@@ -77,10 +77,11 @@ def down(x, indices, weight, scales, biases, *, results_per_simd=4, simdgroups=2
     if (results_per_simd, simdgroups) not in TILES or not all(
             type(value) is int for value in (results_per_simd, simdgroups)):
         raise ValueError("down tile requires rows in (2, 4, 8, 16) and SIMDgroups in (2, 4)")
-    if x.shape != (1, 1, 8, 1, 512) or x.dtype != mx.float16:
-        raise ValueError("down requires [1, 1, 8, 1, 512] float16 activations")
-    if indices.shape != (1, 1, 8) or indices.dtype != mx.uint32:
-        raise ValueError("down requires [1, 1, 8] uint32 expert indices")
+    if (x.ndim != 5 or x.shape[0] != 1 or x.shape[1] not in (1, 2, 3)
+            or x.shape[2:] != (8, 1, 512) or x.dtype != mx.float16):
+        raise ValueError("down requires [1, S, 8, 1, 512], S=1..3, float16 activations")
+    if indices.shape != (*x.shape[:2], 8) or indices.dtype != mx.uint32:
+        raise ValueError("down requires [1, S, 8] uint32 expert indices")
     if (weight.ndim != 3 or weight.dtype != mx.uint32 or weight.shape[0] < 1
             or weight.shape[-1] != 96 or weight.shape[1] < 1
             or weight.shape[1] % (results_per_simd * simdgroups)):
@@ -92,17 +93,18 @@ def down(x, indices, weight, scales, biases, *, results_per_simd=4, simdgroups=2
     return _kernel()(
         inputs=[x, indices, weight, scales, biases],
         template=[("N", n), ("E", e), ("ROWS", results_per_simd), ("SIMDGROUPS", simdgroups)],
-        grid=(n // (results_per_simd * simdgroups) * 32 * simdgroups, 8, 1),
+        grid=(n // (results_per_simd * simdgroups) * 32 * simdgroups, indices.size, 1),
         threadgroup=(32 * simdgroups, 1, 1),
-        output_shapes=[(1, 1, 8, 1, n)], output_dtypes=[mx.float16],
+        output_shapes=[(*indices.shape, 1, n)], output_dtypes=[mx.float16],
     )[0]
 
 
 class _DownProjection(QuantizedSwitchLinear):
     def __call__(self, x, indices, sorted_indices=False):
         if (not self.training and not sorted_indices
-                and x.shape == (1, 1, 8, 1, 512) and x.dtype == mx.float16
-                and indices.shape == (1, 1, 8) and indices.dtype == mx.uint32):
+                and x.ndim == 5 and x.shape[0] == 1 and x.shape[1] in (1, 2, 3)
+                and x.shape[2:] == (8, 1, 512) and x.dtype == mx.float16
+                and indices.shape == (*x.shape[:2], 8) and indices.dtype == mx.uint32):
             return down(x, indices, self.weight, self.scales, self.biases,
                         results_per_simd=4, simdgroups=4)
         return QuantizedSwitchLinear.__call__(self, x, indices, sorted_indices)
