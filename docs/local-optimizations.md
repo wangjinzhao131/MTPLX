@@ -25,18 +25,21 @@ MLX is pinned to 0.32.2 by the project. The validation environment used Python 3
 
 These recipes select `performance-cold` to retain native caches and in-model prefill and disable background warmup. The 35B recipe restores a 128K context window; the 27B recipe retains the 4K integration-test setting. The default `sustained` profile enables external prefill and paged caches that can bypass these kernels. Full-window and concurrent-load performance have not been validated for the port.
 
-Enable `MTPLX_SUSTAINED_PREFILL=1` separately to split long input into bounded chunks while retaining native caches. Without this switch, the AR path forwards the entire prompt even when `--prefill-chunk-tokens` is set. The 35B recipe uses 128-token chunks to reduce temporary GPU memory use; this does not limit the context window.
+Enable `MTPLX_SUSTAINED_PREFILL=1` separately to split long input into bounded chunks while retaining native caches. Without this switch, the AR path forwards the entire prompt even when `--prefill-chunk-tokens` is set. The 35B recipe uses 64-token chunks; this does not limit the context window. For this checkpoint, chunks of 128 tokens or more can trigger MLX 0.32.2's sorted expert-matmul path to copy the fused gate/up weight views, adding about 16.25 GiB of temporary allocations across the model.
+
+Set both the global chunk size and the restored-suffix limit below. The request-level CLI option alone does not cover background session commits, and the default 512-token suffix fast path bypasses chunking. These settings bound both foreground and background prefill while retaining the decode kernels and memory guards. Background warmup remains disabled in this recipe.
 
 35B uses AR because the measured layer islands span the native model forward; MTP injection would replace that forward. The loader disables MTP for this profile. Pass `--stock-ar` so the server also selects AR (the flag is the upstream name for `--generation-mode ar --no-load-mtp`; local kernels are still active).
 
 ```sh
 MTPLX_LOCAL_OPT=qwen35-ar MTPLX_WARMUP_EXTENDED=0 MTPLX_SUSTAINED_PREFILL=1 \
+MTPLX_PREFILL_CHUNK_SIZE=64 MTPLX_SMALL_SUFFIX_FUSED_MAX=64 \
 MLX_MAX_MB_PER_BUFFER=16384 MLX_MAX_OPS_PER_BUFFER=4096 \
 .venv/bin/python -m mtplx.server.openai \
   --model /path/to/Qwen3.6-35B-A3B-MTPLX-Optimized-Balance-FP16 \
   --model-id local-qwen35 --host 127.0.0.1 --port 8008 \
   --profile performance-cold --stock-ar --scheduler-mode serial --fan-mode default \
-  --context-window 131072 --prefill-chunk-tokens 128 --warmup-tokens 0 --no-enable-thinking
+  --context-window 131072 --prefill-chunk-tokens 64 --warmup-tokens 0 --no-enable-thinking
 ```
 
 27B retains MTP and all prefix states needed to commit only the accepted draft prefix. Select stock verification so the compiled capture hook can engage; the server's upstream default selects a different capture kernel. The default Qwen backend uses committed MTP history and the stock draft core. Local profiles bypass draft-head requantization in both CLI and server.
@@ -84,4 +87,4 @@ Separate processes, one warmup, greedy English/Chinese/code prompts × 128 gener
 
 Validation: 560 combined kernel, loader, cache, MTP, and server tests passed. A subsequent targeted run passed 8 profile/draft-head tests (566 distinct tests across both runs). Both real-model HTTP services passed health/profile checks, identical ordinary/SSE output for 64 greedy tokens, and HTTP 400 rejection of image requests. The 27B health receipt confirms that draft-head requantization was skipped. See [HTTP receipts](benchmarks/local-optimizations/http-smoke.json). The full upstream suite was not run.
 
-The restored 35B service reports 131,072 tokens for both its configured and execution windows. A fresh 5,035-token HTTP prompt completed successfully using 40 prefill chunks of at most 128 tokens, with `qwen35-ar` still active and a 48.04 GB peak allocation. This checks operation beyond the previous 4K setting; it is not a full 128K stress test.
+The restored 35B service reports 131,072 tokens for both its configured and execution windows. Two consecutive streamed requests with mixed code/prose and an OpenAI tool schema used 8,860 and 9,007 prompt tokens. The cold request used 139 chunks and delivered its first token in 29.63 seconds; the second reused 8,906 cached tokens and delivered its first token in 0.49 seconds. Both decoded at about 62 tok/s. With the 64-token foreground, global and suffix limits above, peak allocation stayed at 30.75 GB after background session commits, with no prefill memory aborts. See the [long-input HTTP receipt](benchmarks/local-optimizations/long-context-http-smoke.json). This is a multi-turn integration check, not a full 128K stress test or a replay of a private Hermes conversation.
