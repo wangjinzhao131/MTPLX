@@ -23,17 +23,20 @@ MLX is pinned to 0.32.2 by the project. The validation environment used Python 3
 
 ## OpenAI-compatible API
 
-These recipes select `performance-cold` to retain native caches and in-model prefill, disable background warmup, and use a 4K context window. The default `sustained` profile enables external prefill and paged caches that can bypass these kernels. Larger windows and concurrent serving have not been validated for the port.
+These recipes select `performance-cold` to retain native caches and in-model prefill and disable background warmup. The 35B recipe restores a 128K context window; the 27B recipe retains the 4K integration-test setting. The default `sustained` profile enables external prefill and paged caches that can bypass these kernels. Full-window and concurrent-load performance have not been validated for the port.
+
+Enable `MTPLX_SUSTAINED_PREFILL=1` separately to split long input into bounded chunks while retaining native caches. Without this switch, the AR path forwards the entire prompt even when `--prefill-chunk-tokens` is set. The 35B recipe uses 128-token chunks to reduce temporary GPU memory use; this does not limit the context window.
 
 35B uses AR because the measured layer islands span the native model forward; MTP injection would replace that forward. The loader disables MTP for this profile. Pass `--stock-ar` so the server also selects AR (the flag is the upstream name for `--generation-mode ar --no-load-mtp`; local kernels are still active).
 
 ```sh
-MTPLX_LOCAL_OPT=qwen35-ar MTPLX_WARMUP_EXTENDED=0 \
+MTPLX_LOCAL_OPT=qwen35-ar MTPLX_WARMUP_EXTENDED=0 MTPLX_SUSTAINED_PREFILL=1 \
 MLX_MAX_MB_PER_BUFFER=16384 MLX_MAX_OPS_PER_BUFFER=4096 \
 .venv/bin/python -m mtplx.server.openai \
   --model /path/to/Qwen3.6-35B-A3B-MTPLX-Optimized-Balance-FP16 \
   --model-id local-qwen35 --host 127.0.0.1 --port 8008 \
-  --profile performance-cold --stock-ar --scheduler-mode serial --fan-mode default --context-window 4096 --warmup-tokens 0 --no-enable-thinking
+  --profile performance-cold --stock-ar --scheduler-mode serial --fan-mode default \
+  --context-window 131072 --prefill-chunk-tokens 128 --warmup-tokens 0 --no-enable-thinking
 ```
 
 27B retains MTP and all prefix states needed to commit only the accepted draft prefix. Select stock verification so the compiled capture hook can engage; the server's upstream default selects a different capture kernel. The default Qwen backend uses committed MTP history and the stock draft core. Local profiles bypass draft-head requantization in both CLI and server.
@@ -80,3 +83,5 @@ Separate processes, one warmup, greedy English/Chinese/code prompts × 128 gener
 35B recorded 400 layer-island calls; 27B recorded 10,272 compiled GDN capture calls, including warmup. Peak MLX allocation was approximately 28.81 GB for both 35B runs and 20.44 → 20.41 GB for 27B. Raw token/timing reports are in [benchmarks/local-optimizations](benchmarks/local-optimizations). No long-context or concurrent-load performance claim is made for this port.
 
 Validation: 560 combined kernel, loader, cache, MTP, and server tests passed. A subsequent targeted run passed 8 profile/draft-head tests (566 distinct tests across both runs). Both real-model HTTP services passed health/profile checks, identical ordinary/SSE output for 64 greedy tokens, and HTTP 400 rejection of image requests. The 27B health receipt confirms that draft-head requantization was skipped. See [HTTP receipts](benchmarks/local-optimizations/http-smoke.json). The full upstream suite was not run.
+
+The restored 35B service reports 131,072 tokens for both its configured and execution windows. A fresh 5,035-token HTTP prompt completed successfully using 40 prefill chunks of at most 128 tokens, with `qwen35-ar` still active and a 48.04 GB peak allocation. This checks operation beyond the previous 4K setting; it is not a full 128K stress test.
