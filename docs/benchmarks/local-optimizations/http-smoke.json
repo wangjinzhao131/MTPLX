@@ -1,0 +1,32 @@
+[
+  {
+    "profile": "qwen35-ar",
+    "mtp_enabled": false,
+    "vision_enabled": false,
+    "image_status": 400,
+    "stream_matches": true,
+    "finish_reason": "length",
+    "draft_head": {
+      "installed": false,
+      "reason": "mtp_disabled"
+    },
+    "completion_tokens": 64,
+    "response_stats_profile": "qwen35-ar",
+    "decode_tok_s": 67.32065883588179
+  },
+  {
+    "profile": "qwen27-mtp",
+    "mtp_enabled": true,
+    "vision_enabled": false,
+    "image_status": 400,
+    "stream_matches": true,
+    "finish_reason": "length",
+    "draft_head": {
+      "installed": false,
+      "reason": "local_optimization_original_weights"
+    },
+    "completion_tokens": 64,
+    "response_stats_profile": "qwen27-mtp",
+    "decode_tok_s": 23.84494452898375
+  }
+]

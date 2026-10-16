@@ -402,6 +402,8 @@ def _is_rotated_packed_head(module: Any) -> bool:
 
 
 def _install_draft_lm_head(rt: Any, *, bits: int, group_size: int, mode: str) -> dict[str, Any]:
+    if getattr(rt, "local_optimization", None):
+        return {"installed": False, "reason": "local_optimization_original_weights"}
     import mlx.nn as nn
 
     text = _text_model(rt.model)

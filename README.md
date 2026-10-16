@@ -1,3 +1,5 @@
+This fork adds opt-in Qwen 35B AR and 27B MTP kernels. See [local optimization profiles](docs/local-optimizations.md) for installation, launch commands, provenance, and validation. The upstream benchmark claims below describe upstream releases.
+
 <div align="center">
 
 <img src="docs/assets/readme/hero.svg" alt="MTPLX" width="100%" />

@@ -3244,6 +3244,10 @@ def test_generation_truth_stats_distinguish_stock_ar_from_target_ar():
     assert stock["benchmark_mode"] == "mtplx_stock_ar_unloaded"
     assert stock["load_mtp"] is False
     assert stock["runtime_mtp_enabled"] is False
+    stock_state.runtime.local_optimization = "qwen35-ar"
+    assert openai._generation_truth_stats(stock_state, "ar")["local_optimization"] == "qwen35-ar"
+    stock_state._vision_spec_cache = object()
+    assert openai._server_vision_spec(stock_state) is None
 
 
 def test_chat_generation_mode_request_override_routes_mtp_depth(monkeypatch):

@@ -2587,6 +2587,18 @@ def gdn_forward_with_capture(
     *,
     capture_backend: str | None = None,
 ):
+    hook = getattr(gdn, "_local_capture", _gdn_forward_with_capture)
+    return hook(gdn, inputs, mask, cache, capture_backend=capture_backend)
+
+
+def _gdn_forward_with_capture(
+    gdn: Any,
+    inputs: mx.array,
+    mask: Any = None,
+    cache: Any = None,
+    *,
+    capture_backend: str | None = None,
+):
     if getattr(gdn, "sharding_group", None) is not None:
         _count_gdn_capture_fallback("sharding_group")
         return gdn(inputs, mask=mask, cache=cache), None

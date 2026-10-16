@@ -672,6 +672,14 @@ def load(
             return runtime
         path = Path(gemma4_pair["target_model"])
     config = load_config(path)
+    from . import local_optimizations
+
+    local_opt = local_optimizations.resolve(
+        config, mtp_adapter=mtp_adapter, proj_quant=proj_quant, proj_requant=proj_requant
+    )
+    if local_opt == "qwen35-ar":
+        mtp = False
+        logger.info("[local-opt] qwen35-ar selects autoregressive generation")
     _export_derived_model_geometry(config)
     from .a3b_whole_moe import validate_a3b_whole_moe_load_options
 
@@ -717,6 +725,8 @@ def load(
         model, _loaded_config = load_model(path)
     else:
         model, tokenizer = _load_base_model(path, config)
+    if local_opt:
+        local_optimizations.apply(model, local_opt)
     import os as _os
 
     proj_quant = proj_quant or _os.environ.get("MTPLX_PROJ_QUANT") or None
@@ -832,7 +842,7 @@ def load(
     router_report: dict[str, Any] = {}
     # Laguna skips the qwen3-next kernel stack entirely; its own env-gated
     # fused lanes install right before runtime construction below.
-    if not _is_laguna_s_2_1_mlx_4bit_config(config):
+    if not local_opt and not _is_laguna_s_2_1_mlx_4bit_config(config):
         from .attention_split import configure_split_full_attention
         from .moe_packed_projections import (
             configure_moe_packed_projections,
@@ -1130,6 +1140,7 @@ def load(
     # The server prints this as its startup engagement receipt; logger.info
     # alone is invisible under `python -m mtplx.server.openai` (no handler).
     runtime.laguna_fused_report = fused_report
+    runtime.local_optimization = local_opt
     # Gate on the object that actually runs the layer loop, not the config
     # string: dense Qwen3.8 loads as plain `qwen3_5`, and mtp_patch shadows
     # the TextModel class with its own loop — but the layers stay stock
@@ -1140,7 +1151,7 @@ def load(
         _inner_text = getattr(
             getattr(model, "language_model", model), "model", None
         )
-        if isinstance(_inner_text, _qwen3_5_module.Qwen3_5TextModel):
+        if not local_opt and isinstance(_inner_text, _qwen3_5_module.Qwen3_5TextModel):
             from .packed_concats import install_qwen3_next_packed_concats
             from .prefill_rungs import install_qwen3_5_prefill_rungs
 

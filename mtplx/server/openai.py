@@ -5584,6 +5584,8 @@ def _escape_vision_control_value(value: Any) -> Any:
 
 
 def _server_vision_spec(state: Any) -> Any | None:
+    if getattr(getattr(state, "runtime", None), "local_optimization", None):
+        return None  # These profiles use text-only native attention positions.
     cached = getattr(state, "_vision_spec_cache", "unset")
     if cached != "unset":
         return cached
@@ -25323,6 +25325,7 @@ def _generation_truth_stats(
         benchmark_mode = "mtplx_unclassified"
     return {
         "benchmark_mode": benchmark_mode,
+        "local_optimization": getattr(state.runtime, "local_optimization", None),
         "load_mtp": load_mtp,
         "runtime_mtp_enabled": runtime_mtp_enabled,
         "draft_head_installed": draft_head_installed,
@@ -25331,6 +25334,7 @@ def _generation_truth_stats(
 
 
 PUBLIC_MTPLX_STATS_KEYS = (
+    "local_optimization",
     "mode",
     "profile",
     "benchmark_mode",
@@ -36289,6 +36293,7 @@ def create_app(state: ServerState) -> FastAPI:
             profile_payload["sampler"] = active_sampler
         return {
             "ok": True,
+            "local_optimization": getattr(runtime, "local_optimization", None),
             "model": state.model_id,
             "model_path": str(
                 getattr(runtime, "model_path", None) or getattr(state.args, "model", "")
