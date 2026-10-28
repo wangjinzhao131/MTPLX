@@ -239,6 +239,7 @@ def test_a_turn_changed_after_the_image_restores_at_the_pre_image_anchor(policy)
     warm = _state(_runtime(), second, policy=policy, bank=bank)
     assert warm.cached_tokens == 40, (warm.restore_mode, warm.cache_miss_reason)
     assert warm.suffix_tokens == len(second) - 40
+    assert warm.gdn_boundaries.plan.shared_prefix is None
     cold = _state(_runtime(), second, policy=policy)
     assert warm.logits.tolist() == cold.logits.tolist()
     # The restored turn keeps the anchors it inherited, still none past the

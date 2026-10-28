@@ -127,3 +127,12 @@ def test_live_referenced_entries_are_never_victims():
     assert bank.shrink_for_admission(0) == (0, 1)
     assert (1, 2, 9, 9) in _keys(bank)
     assert (1, 2, 3, 4, 5) not in _keys(bank)
+
+
+def test_soft_headroom_reclaims_siblings_but_keeps_each_terminal():
+    bank = _bank()
+    _put(bank, (1, 9), session_id="a", nbytes=80)
+    _put(bank, (1, 2, 3), session_id="a", nbytes=100)
+    _put(bank, (7, 7), session_id="b", nbytes=50)
+    assert bank.shrink_for_admission(0, allow_terminal=False) == (1, 0)
+    assert _keys(bank) == {(1, 2, 3), (7, 7)}

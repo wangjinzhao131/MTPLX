@@ -13,13 +13,13 @@ import { useDashboardStore } from "../state/store";
 // Mirrors `CacheMissReason` enum (mtplx/session_bank.py:29-39).
 const REASON_TOOLTIPS: Record<string, string> = {
   POLICY_MISMATCH:
-    "Sampling/depth knobs changed between requests; the cached state is no longer policy-equivalent.",
-  TEMPLATE_MISMATCH: "Chat template changed (system prompt, role tags); cache cannot be re-used.",
-  MODEL_MISMATCH: "Different model loaded since the cached prefix was created.",
-  SNAPSHOT_DESYNC: "Engine state diverged from the cached snapshot.",
-  EVICTED: "LRU eviction made room for a newer prefix.",
-  SESSION_BUSY: "Another request currently holds this session's lease.",
-  NEW_SESSION: "First request for this session id; no prior prefix to reuse.",
+    "请求间的采样或深度参数发生变化，缓存策略不再一致。",
+  TEMPLATE_MISMATCH: "聊天模板发生变化（系统提示、角色标记），无法复用缓存。",
+  MODEL_MISMATCH: "当前模型与创建缓存时的模型不同。",
+  SNAPSHOT_DESYNC: "引擎状态与缓存快照不一致。",
+  EVICTED: "按最近最少使用策略回收缓存，为新前缀腾出空间。",
+  SESSION_BUSY: "另一个请求正在使用此会话的缓存。",
+  NEW_SESSION: "该会话的首个请求，没有可复用的旧前缀。",
 };
 
 export function EvictionReasonHistogram() {
@@ -35,17 +35,17 @@ export function EvictionReasonHistogram() {
 
   return (
     <Card
-      title="Eviction reasons · last 16"
+      title="缓存回收原因 · 最近 16 次"
       subtitle={
         sessionBank?.last_miss_reason
-          ? `most recent: ${sessionBank.last_miss_reason}`
-          : "no evictions yet"
+          ? `最近：${sessionBank.last_miss_reason}`
+          : "尚无缓存回收"
       }
     >
       <div className="h-[220px]">
         {rows.length === 0 ? (
           <div className="h-full grid place-items-center text-[var(--text-muted)] text-sm">
-            SessionBank stable · no evictions
+            会话缓存稳定 · 未发生回收
           </div>
         ) : (
           <ResponsiveContainer width="100%" height="100%">
@@ -76,8 +76,8 @@ export function EvictionReasonHistogram() {
                 // shape is still a [label, name] tuple.
                 formatter={((value: unknown, _name: unknown, item: { payload?: { reason?: string } }) => {
                   const reason = String(item?.payload?.reason ?? "");
-                  const tooltip = REASON_TOOLTIPS[reason] ?? "Cache eviction reason.";
-                  return [`${value} · ${tooltip}`, "count"];
+                  const tooltip = REASON_TOOLTIPS[reason] ?? "缓存回收原因。";
+                  return [`${value} · ${tooltip}`, "次数"];
                 }) as never}
               />
               <Bar dataKey="count" fill="rgba(240,180,41,0.85)" radius={[6, 6, 0, 0]} />

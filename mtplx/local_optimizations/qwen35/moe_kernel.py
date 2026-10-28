@@ -1,4 +1,4 @@
-"""Experimental affine6/group64 FP16 expert gate/up + SwiGLU decode kernel.
+"""Affine6/group64 FP16 expert gate/up fusion for decode and sorted prefill.
 
 The packed input is [experts, gate rows followed by up rows, packed K], as in
 fusion.py. No codes, scales, biases or quantization metadata are changed.
@@ -20,7 +20,7 @@ from functools import lru_cache
 import mlx.core as mx
 from mlx_lm.models.qwen3_5 import DecoderLayer
 from mlx_lm.models.qwen3_next import Qwen3NextSparseMoeBlock
-from mlx_lm.models.switch_layers import SwitchGLU, SwiGLU
+from mlx_lm.models.switch_layers import SwitchGLU, SwiGLU, _gather_sort, _scatter_unsort
 
 from .fusion import _ExpertMember
 
@@ -203,6 +203,19 @@ class _FusedSwitchGLU(SwitchGLU):
     def __call__(self, x, indices):
         if self._decode_ready(x, indices):
             return self.down_proj(self._hidden(x, indices), indices).squeeze(-2)
+        # shortcut: B1/FP16 sorted prefill only; validate other shapes before extending.
+        if (not self.training and not self.gate_proj.training and not self.up_proj.training
+                and x.ndim == 3 and x.shape[0] == 1 and x.shape[1] > 3 and x.dtype == mx.float16
+                and indices.ndim == 3 and indices.shape[:2] == x.shape[:2]
+                and indices.dtype == mx.uint32 and indices.size >= 64):
+            hub = self.gate_proj._fusion
+            if hub.outputs is not None:
+                hub.clear()
+            sorted_x, sorted_indices, inverse = _gather_sort(mx.expand_dims(x, (-2, -3)), indices)
+            packed = hub.projection(sorted_x, sorted_indices, sorted_indices=True)
+            gate, up = (mx.contiguous(part) for part in mx.split(packed, hub.boundaries, axis=-1))
+            output = self.down_proj(self.activation(up, gate), sorted_indices, sorted_indices=True)
+            return _scatter_unsort(output, inverse, indices.shape).squeeze(-2)
         return SwitchGLU.__call__(self, x, indices)
 
     def weighted(self, x, indices, scores):
@@ -222,10 +235,11 @@ class _FusedSwitchGLU(SwitchGLU):
 
 
 def apply(model):
-    """Install native-qdot6 gate/up + SwiGLU after fusion, before compilation.
+    """Install fused decode and sorted-prefill gate/up after fusion, before compilation.
 
     Reuse fusion's packed buffers and preserve every parameter name and array.
-    Longer inputs, batches and training retain SwitchGLU's original path.
+    B1/FP16 sorted prefill reuses the packed gate/up projection. Other prefill
+    shapes, batches and training retain SwitchGLU's original path.
     A one-token initial prompt also uses the kernel. Undo before changing weights
     or undoing projection fusion; the returned undo is idempotent.
     """

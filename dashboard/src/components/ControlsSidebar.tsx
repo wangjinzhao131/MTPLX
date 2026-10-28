@@ -148,9 +148,9 @@ function DefaultsCard() {
 
   if (!draft) {
     return (
-      <Card title="Defaults" subtitle="loading server settings...">
+      <Card title="默认参数" subtitle="正在加载服务设置…">
         <div className="text-sm text-[var(--text-muted)]">
-          Settings will appear once the dashboard receives its first snapshot.
+          收到首个服务快照后将显示设置。
         </div>
       </Card>
     );
@@ -158,28 +158,28 @@ function DefaultsCard() {
 
   return (
     <Card
-      title="Defaults"
-      subtitle="server-side defaults applied to every chat completion"
+      title="默认参数"
+      subtitle="每次聊天请求使用的服务端默认参数"
       action={
         mutation.isPending ? (
-          <span className="text-xs text-[var(--text-muted)]">applying…</span>
+          <span className="text-xs text-[var(--text-muted)]">正在应用…</span>
         ) : lastApplied ? (
           <span className="text-xs text-[var(--text-muted)]">
-            applied · {Object.keys(lastApplied).join(", ")}
+            已应用 · {Object.keys(lastApplied).join(", ")}
           </span>
         ) : undefined
       }
     >
       <div className="space-y-4">
         <NumberField
-          label="depth"
+          label="推测深度"
           value={draft.depth}
           min={0}
           max={5}
           onChange={(v) => edit("depth", v)}
         />
         <NumberField
-          label="temperature"
+          label="采样温度"
           value={draft.temperature}
           min={0}
           max={2}
@@ -187,7 +187,7 @@ function DefaultsCard() {
           onChange={(v) => edit("temperature", v)}
         />
         <NumberField
-          label="top_p"
+          label="核采样（top_p）"
           value={draft.top_p}
           min={0}
           max={1}
@@ -195,7 +195,7 @@ function DefaultsCard() {
           onChange={(v) => edit("top_p", v)}
         />
         <NumberField
-          label="top_k"
+          label="候选数（top_k）"
           value={draft.top_k}
           min={0}
           max={2000}
@@ -203,16 +203,16 @@ function DefaultsCard() {
           onChange={(v) => edit("top_k", v)}
         />
         <NumberField
-          label="presence_penalty"
+          label="重复惩罚"
           value={draft.presence_penalty ?? 0}
           min={0}
           max={2}
           step={0.05}
           onChange={(v) => edit("presence_penalty", v)}
-          description="0 is exact (best for coding); 0.5-1.5 discourages repetition."
+          description="0 不施加惩罚（适合编程）；0.5–1.5 可减少重复。"
         />
         <NumberField
-          label="stream_interval"
+          label="流式输出间隔"
           value={draft.stream_interval}
           min={1}
           max={32}
@@ -220,20 +220,20 @@ function DefaultsCard() {
           onChange={(v) => edit("stream_interval", v)}
         />
         <ToggleField
-          label="enable_thinking"
+          label="开启思考"
           value={draft.enable_thinking}
           onChange={(v) => edit("enable_thinking", v)}
-          description="When on, requests default to including reasoning content."
+          description="开启后，请求默认包含思考内容。"
         />
         <SelectField
-          label="reasoning_parser"
+          label="思考内容解析器"
           value={draft.reasoning_parser}
           options={["qwen3", "poolside_v1", "none"]}
           onChange={(v) => edit("reasoning_parser", v)}
         />
         {changedOnServer.length > 0 ? (
           <div className="text-xs text-[var(--accent-warm)]">
-            updated on the server: {changedOnServer.join(", ")}
+            服务端已更新：{changedOnServer.join(", ")}
           </div>
         ) : null}
         {mutation.isError ? (
@@ -362,13 +362,11 @@ function RestartRequiredCard() {
   };
   return (
     <Card
-      title="Restart required"
-      subtitle="profile · model · MTP · host · port can only change at startup"
+      title="需要重启的设置"
+      subtitle="配置方案、模型、MTP、地址和端口只能在启动时修改"
     >
       <p className="text-xs text-[var(--text-muted)] mb-3">
-        These settings live on <code>state.args</code> but require a model
-        reload to take effect. The dashboard refuses to mutate them through
-        the live settings endpoint. Copy the CLI command instead.
+        这些参数需要重新加载模型后生效，不能通过在线设置修改。可复制下方命令，在需要时手动重启服务。
       </p>
       <div className="rounded border border-[var(--border-soft)] bg-[var(--bg-elevated)] px-3 py-2 font-mono text-xs text-[var(--text-primary)] overflow-x-auto">
         {restartCommand}
@@ -379,7 +377,7 @@ function RestartRequiredCard() {
         className="mt-3 inline-flex items-center gap-1.5 text-xs text-[var(--accent-cool)] hover:text-[var(--accent)]"
       >
         <Copy className="size-3.5" />
-        copy restart command
+        复制重启命令
       </button>
     </Card>
   );
@@ -396,20 +394,19 @@ function AdminActions() {
     },
   });
   return (
-    <Card title="Admin actions" subtitle="bank-wide controls">
+    <Card title="管理操作" subtitle="整个会话缓存库的操作">
       <button
         type="button"
         onClick={() => setConfirming(true)}
         className="inline-flex items-center gap-2 text-sm text-[var(--accent-hot)] hover:bg-[var(--accent-hot)]/10 rounded px-3 py-2 transition-colors"
       >
         <Trash className="size-4" />
-        Clear all SessionBank entries
+        清空所有会话缓存
       </button>
       {confirming ? (
         <div className="mt-3 p-3 rounded-md border border-[var(--accent-hot)]/40 bg-[var(--accent-hot)]/5 text-sm text-[var(--text-primary)]">
           <p>
-            Evict every cached prefix? Future requests will pay full prefill
-            until the cache refills.
+            确定清空所有缓存前缀？缓存重新建立前，后续请求需要完整预填充。
           </p>
           <div className="mt-3 flex gap-2">
             <button
@@ -418,14 +415,14 @@ function AdminActions() {
               disabled={clearAll.isPending}
               className="text-xs px-3 py-1 rounded bg-[var(--accent-hot)] text-white disabled:opacity-50"
             >
-              {clearAll.isPending ? "Clearing..." : "Yes, clear cache"}
+              {clearAll.isPending ? "正在清空…" : "确认清空缓存"}
             </button>
             <button
               type="button"
               onClick={() => setConfirming(false)}
               className="text-xs px-3 py-1 rounded border border-[var(--border-soft)] text-[var(--text-muted)]"
             >
-              Cancel
+              取消
             </button>
           </div>
         </div>

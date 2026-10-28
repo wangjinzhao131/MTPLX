@@ -31,10 +31,10 @@ export function SessionBankGrid() {
 
   return (
     <Card
-      title="SessionBank · warm prefix cache"
-      subtitle={`${prefixes.length} / ${max} slots · ${fmtBytes(totalBytes)} total${
+      title="会话缓存库 · 已缓存前缀"
+      subtitle={`${prefixes.length} / ${max} 个缓存位 · 共 ${fmtBytes(totalBytes)}${
         sessionBank?.last_miss_reason
-          ? ` · last miss: ${sessionBank.last_miss_reason}`
+          ? ` · 最近未命中：${sessionBank.last_miss_reason}`
           : ""
       }`}
     >
@@ -73,7 +73,7 @@ function SlotCard({
   if (!slot) {
     return (
       <div className="rounded-lg border border-dashed border-[var(--border-soft)] bg-[var(--bg-elevated)] aspect-square p-3 grid place-items-center text-[var(--text-muted)] text-xs">
-        slot {index + 1} · empty
+        缓存位 {index + 1} · 空
       </div>
     );
   }
@@ -95,12 +95,12 @@ function SlotCard({
     >
       <div className="flex items-center justify-between">
         <span className="text-[10px] uppercase tracking-widest text-[var(--text-muted)]">
-          slot {index + 1}
+          缓存位 {index + 1}
         </span>
         {inFlight ? (
           <span className="inline-flex items-center gap-1 text-[10px] text-[var(--accent)]">
             <span className="w-1.5 h-1.5 rounded-full bg-[var(--accent)] animate-pulse" />
-            in flight
+            正在处理
           </span>
         ) : hot ? (
           <Zap className="size-3 text-[var(--accent-warm)]" />
@@ -112,10 +112,10 @@ function SlotCard({
         {truncateMiddle(slot.session_id, 24)}
       </div>
       <dl className="mt-2 grid grid-cols-2 gap-x-2 gap-y-1 text-[11px]">
-        <Tag label="prefix" value={fmtNumber(slot.prefix_len)} />
-        <Tag label="hits" value={fmtNumber(slot.hits)} />
-        <Tag label="bytes" value={fmtBytes(slot.nbytes)} />
-        <Tag label="age" value={relativeTime(slot.last_access_s)} />
+        <Tag label="前缀长度" value={fmtNumber(slot.prefix_len)} />
+        <Tag label="命中次数" value={fmtNumber(slot.hits)} />
+        <Tag label="占用" value={fmtBytes(slot.nbytes)} />
+        <Tag label="最近访问" value={relativeTime(slot.last_access_s)} />
       </dl>
       <button
         onClick={(e) => {
@@ -123,7 +123,7 @@ function SlotCard({
           onEvict(slot.session_id);
         }}
         className="absolute top-2 right-2 opacity-0 group-hover:opacity-100 text-[var(--text-muted)] hover:text-[var(--accent-hot)] transition-opacity"
-        title="Evict this slot"
+        title="移除此缓存项"
       >
         <X className="size-3.5" />
       </button>

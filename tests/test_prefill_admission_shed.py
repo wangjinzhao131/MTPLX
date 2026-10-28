@@ -634,6 +634,7 @@ class _ChainBank(_Bank):
         reason="",
         protect_keys=None,
         protect_session_ids=None,
+        allow_terminal=True,
     ):
         self.chain_calls.append((int(target_bytes), reason))
         keep_keys = {tuple(key) for key in (protect_keys or ())}
@@ -672,6 +673,8 @@ class _ChainBank(_Bank):
                 break
             self.entries.remove(candidates[0])
             non_terminal += 1
+        if not allow_terminal:
+            return non_terminal, 0
         terminals = 0
         while self.entries and self.total_nbytes > int(target_bytes):
             candidates = [e for e in self.entries if id(e) not in protected]

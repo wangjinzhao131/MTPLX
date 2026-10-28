@@ -625,6 +625,8 @@ def resolve_request_policy(
             messages_for_generation = srv._with_mtplx_pi_convergence_contract(
                 messages_for_generation
             )
+    if len(messages_for_generation) > len(messages_before_turn_contract):
+        messages_for_generation[-1]._mtplx_transient_suffix = True
     read_only_inspection_request = bool(
         chat
         and srv._is_read_only_inspection_request(

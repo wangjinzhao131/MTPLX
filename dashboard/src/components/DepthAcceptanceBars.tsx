@@ -36,11 +36,11 @@ export function DepthAcceptanceBars() {
 
   return (
     <Card
-      title="Per-depth acceptance"
+      title="各深度的接受率"
       subtitle={
         rows.length > 0
-          ? `${fmtNumber(latest?.verify_calls)} verify calls · ${fmtNumber(acceptedTotal)} accepted of ${fmtNumber(draftedTotal)} drafted`
-          : "no completed generation yet"
+          ? `${fmtNumber(latest?.verify_calls)} 次验证 · 接受 ${fmtNumber(acceptedTotal)} / ${fmtNumber(draftedTotal)} 个草稿 token`
+          : "尚无完成的生成任务"
       }
     >
       <div className="h-[260px]">
@@ -82,7 +82,7 @@ export function DepthAcceptanceBars() {
                 yAxisId="left"
                 dataKey="rate"
                 fill="rgba(0,214,143,0.85)"
-                name="accept rate"
+                name="接受率"
                 radius={[6, 6, 0, 0]}
               />
               <Line
@@ -92,7 +92,7 @@ export function DepthAcceptanceBars() {
                 stroke="rgba(240,180,41,0.95)"
                 strokeWidth={2}
                 dot={{ r: 4 }}
-                name="mean P(accept)"
+                name="平均接受概率"
               />
             </ComposedChart>
           </ResponsiveContainer>
@@ -105,7 +105,7 @@ export function DepthAcceptanceBars() {
 function EmptyState() {
   return (
     <div className="h-full grid place-items-center text-[var(--text-muted)] text-sm">
-      Run a generation to populate per-depth acceptance.
+      完成一次生成后，将显示各深度的接受率。
     </div>
   );
 }

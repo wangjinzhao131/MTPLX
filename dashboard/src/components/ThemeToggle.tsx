@@ -7,11 +7,11 @@ export function ThemeToggle() {
   return (
     <button
       onClick={cycleTheme}
-      title={`Theme: ${theme} (press T to cycle)`}
+      title={`主题：${theme}（按 T 切换）`}
       className="flex items-center gap-1.5 text-xs text-[var(--text-muted)] hover:text-[var(--text-primary)]"
     >
       <Palette className="size-4" />
-      <span className="hidden lg:inline">{theme}</span>
+      <span className="hidden lg:inline">{{ hippo: "河马", river: "河流", light: "明亮", mono: "单色" }[theme]}</span>
     </button>
   );
 }

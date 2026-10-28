@@ -15,12 +15,15 @@ again each time the newest record moved eroded the middle: on 2026-09-29 a
 function). The kept set is now chosen from anchors that do not move as the
 frontier advances, in this order:
 
+* the system/tool prefix, when known, so replacing the first user question
+  can reuse it even after a long conversation;
 * the prompt-end anchor: the newest checkpoint at least ``tail_backoff``
   tokens before the prompt end, where the next agent turn diverges (the
   reply after it is re-rendered);
 * for an image prompt, the pre-image anchor: the newest checkpoint at or
   before its first image, where a turn that changes that image resumes;
 * the restore point this prefill resumed from (the previous prompt's end);
+* the proven shared prefix, when replay starts before the matched history;
 * the stable prompt-prefix edge (the turn the tool-continuation hint rides);
 * the newest checkpoint;
 * a fixed absolute grid: the first checkpoint in every ``grid_tokens`` cell,
@@ -96,7 +99,10 @@ class AnchorPlan:
     ``prompt_end``: the last position this prefill can checkpoint (the prompt
     length minus one; None when unknown, and the newest checkpoint stands in).
     ``restore_point``: where the prefill resumed from a stored entry.
+    ``shared_prefix``: the proven match this prefill replays up to, if later.
+    ``explicit_cache_boundary``: the client's requested reusable prefix edge.
     ``stable_prefix``: the stable prompt-prefix edge, when the prompt has one.
+    ``system_prefix``: system/tool text shared even when the first user turn changes.
     ``ceiling``: no checkpoint past this position.
     ``image_spans``: ``[start, end)`` of each image's rows in an image prompt;
     no checkpoint strictly inside one. Image prompts kept none past their
@@ -111,7 +117,10 @@ class AnchorPlan:
     prompt_end: int | None = None
     tail_backoff: int = DEFAULT_TAIL_BACKOFF
     restore_point: int | None = None
+    shared_prefix: int | None = None
+    explicit_cache_boundary: int | None = None
     stable_prefix: int | None = None
+    system_prefix: int | None = None
     ceiling: int | None = None
     image_spans: tuple[tuple[int, int], ...] = ()
     grid_tokens: int = GRID_TOKENS
@@ -212,9 +221,12 @@ def retain_checkpoints(records: Iterable[Any], plan: AnchorPlan) -> list:
     )
     protected: list[int] = []
     for position in (
+        plan.explicit_cache_boundary,
+        plan.system_prefix,
         below_limit[-1] if below_limit else None,
         pre_image[-1] if pre_image else None,
         plan.restore_point,
+        plan.shared_prefix,
         plan.stable_prefix,
         newest,
     ):

@@ -27,8 +27,8 @@ export function SignInGate() {
     } catch (err) {
       setError(
         err instanceof UnauthorizedError
-          ? "That key was not accepted."
-          : `Sign-in failed: ${err instanceof Error ? err.message : String(err)}`,
+          ? "API 密钥无效。"
+          : `登录失败：${err instanceof Error ? err.message : String(err)}`,
       );
       setPending(false);
     }
@@ -45,15 +45,14 @@ export function SignInGate() {
             <KeyRound className="size-4" />
           </span>
           <h2 className="text-base font-semibold text-[var(--text-primary)]">
-            Sign in to the dashboard
+            登录监控面板
           </h2>
         </div>
         <p className="text-sm text-[var(--text-muted)] leading-relaxed">
-          This server was started with an API key. Paste it to continue, or open the
-          dashboard link the server printed at startup.
+          此服务启用了 API 密钥。粘贴密钥继续，或打开服务启动时输出的面板链接。
         </p>
         <label className="block mt-4">
-          <span className="text-xs text-[var(--text-muted)]">API key</span>
+          <span className="text-xs text-[var(--text-muted)]">API 密钥</span>
           <input
             type="password"
             autoComplete="off"
@@ -69,7 +68,7 @@ export function SignInGate() {
           disabled={pending || apiKey.trim().length === 0}
           className="mt-4 w-full rounded-md bg-[var(--accent)] text-black text-sm font-semibold py-2 disabled:opacity-50"
         >
-          {pending ? "Signing in…" : "Sign in"}
+          {pending ? "正在登录…" : "登录"}
         </button>
       </form>
     </div>

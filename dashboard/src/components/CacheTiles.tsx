@@ -8,12 +8,12 @@ export function CumulativeCachedTokensTile() {
   const prompt = lifetime?.prompt_tokens_total ?? 0;
   const ratio = prompt > 0 ? (cached / prompt) * 100 : 0;
   return (
-    <Card title="Cached tokens · lifetime" subtitle="cached / prompt across all requests">
+    <Card title="累计复用 token" subtitle="全部请求的缓存 token / 输入 token">
       <BigNumber
         value={fmtNumber(cached)}
-        unit="tokens"
+        unit="token"
         tone="accent"
-        caption={`${ratio.toFixed(1)}% of ${fmtNumber(prompt)} prompt tokens`}
+        caption={`${ratio.toFixed(1)}% / 共 ${fmtNumber(prompt)} 个输入 token`}
       />
     </Card>
   );
@@ -26,12 +26,12 @@ export function HitRateGauge() {
   const ratio = window.length > 0 ? (hits / window.length) * 100 : 0;
   const tone = ratio >= 70 ? "accent" : ratio >= 40 ? "warm" : "hot";
   return (
-    <Card title="Session cache hit rate" subtitle={`last ${window.length} requests`}>
+    <Card title="会话缓存命中率" subtitle={`最近 ${window.length} 个请求`}>
       <BigNumber
         value={`${ratio.toFixed(0)}%`}
-        unit="hit"
+        unit="命中"
         tone={tone}
-        caption={`${hits} hits / ${window.length} requests`}
+        caption={`${hits} 次命中 / ${window.length} 个请求`}
       />
     </Card>
   );
@@ -53,7 +53,7 @@ export function ContextUtilizationBar() {
           ? "var(--accent-cool)"
           : "var(--accent)";
   return (
-    <Card title="Context window utilization" subtitle={`${fmtNumber(len)} / ${fmtNumber(contextWindow ?? 0)} tokens`}>
+    <Card title="上下文窗口使用率" subtitle={`${fmtNumber(len)} / ${fmtNumber(contextWindow ?? 0)} tokens`}>
       <div className="h-4 w-full rounded-full bg-[var(--bg-elevated)] overflow-hidden border border-[var(--border-soft)]">
         <div
           className="h-full transition-[width] duration-500"

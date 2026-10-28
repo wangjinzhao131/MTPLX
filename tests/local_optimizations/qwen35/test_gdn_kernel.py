@@ -13,18 +13,20 @@ from mtplx.local_optimizations.qwen35.opt import apply as compile_model
 from .test_opt import make_model
 
 
-def reference(gdn, qkv, conv_state):
+def reference(gdn, qkv, conv_state, *, capture=False):
     combined = mx.concatenate([conv_state, qkv], axis=1)
     conv = nn.silu(gdn.conv1d(combined))
     kd = gdn.num_k_heads * gdn.head_k_dim
     q, k, v = mx.split(conv, [kd, 2 * kd], axis=-1)
-    q = q.reshape(1, 1, gdn.num_k_heads, gdn.head_k_dim)
+    tokens = qkv.shape[1]
+    q = q.reshape(1, tokens, gdn.num_k_heads, gdn.head_k_dim)
     k = k.reshape(q.shape)
-    v = v.reshape(1, 1, gdn.num_v_heads, gdn.head_v_dim)
+    v = v.reshape(1, tokens, gdn.num_v_heads, gdn.head_v_dim)
     scale = gdn.head_k_dim ** -0.5
     return ((scale ** 2) * mx.fast.rms_norm(q, None, 1e-6),
             scale * mx.fast.rms_norm(k, None, 1e-6), v,
-            mx.contiguous(combined[:, -3:, :]))
+            mx.stack([combined[:, i + 1:i + 4] for i in range(tokens)], axis=1)
+            if capture else mx.contiguous(combined[:, -3:, :]))
 
 
 class GDNKernelTests(unittest.TestCase):
@@ -82,6 +84,26 @@ class GDNKernelTests(unittest.TestCase):
         ref_cache, opt_cache = sessions[0]
         token = mx.array([[19]])
         self.check_arrays([candidate(token, opt_cache)], [stock(token, ref_cache)], 0.002)
+
+    def test_capture_preprocessing_preserves_every_prefix(self):
+        mx.random.seed(173)
+        for dtype in (mx.float16, mx.float32):
+            gdn = SimpleNamespace(num_k_heads=16, num_v_heads=32, head_k_dim=128, head_v_dim=128)
+            gdn.conv1d = nn.Conv1d(8192, 8192, 4, groups=8192, bias=False)
+            gdn.conv1d.weight = mx.random.normal((8192, 4, 1)).astype(dtype)
+            state = mx.random.normal((1, 3, 8192)).astype(dtype)
+            for tokens in (1, 2, 3):
+                for scale in (0.0, 0.01, 1.0, 10.0):
+                    with self.subTest(dtype=dtype, tokens=tokens, scale=scale):
+                        qkv = (scale * mx.random.normal((1, tokens, 8192))).astype(dtype)
+                        actual = preprocess(gdn, qkv, state, capture=True)
+                        expected = reference(gdn, qkv, state, capture=True)
+                        self.check_arrays(actual, expected, 0 if dtype == mx.float16 else 1e-6)
+                        self.check_arrays(actual[-1:], expected[-1:])
+            with self.assertRaises(ValueError):
+                preprocess(gdn, mx.zeros((1, 4, 8192), dtype=dtype), state, capture=True)
+            with self.assertRaises(ValueError):
+                preprocess(gdn, mx.zeros((1, 2, 8192), dtype=dtype), state)
 
     def test_fallbacks_and_invalid_shapes(self):
         model = make_model()

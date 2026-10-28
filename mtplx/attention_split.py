@@ -73,6 +73,9 @@ def _kv_cache_capacity(cache: Any) -> int | None:
     # Plain instance attributes only: on some containers ``keys`` is a
     # property that dequantizes or concatenates the whole cache.
     fields = getattr(cache, "__dict__", {})
+    blocks = fields.get("key_blocks")
+    if blocks:
+        return sum(int(block.shape[2]) for block in blocks)
     keys = fields.get("keys")
     if keys is None and isinstance(fields.get("cache"), list) and fields["cache"]:
         keys = fields["cache"][0]  # tensor-offset adapters: [keys, values, offset]
@@ -415,7 +418,8 @@ def _install_split_attention_hook(attn: Any) -> bool:
             and cached_prefix_len >= blockwise_threshold
             and hasattr(cache, "update_without_fetch")
             and hasattr(cache, "active_block_slices")
-            and can_slice_mask
+            # The block backend implements only tail-causal attention.
+            and ((isinstance(mask, str) and mask == "causal") or (mask is None and L == 1))
         )
         vllm_metal_paged_enabled = bool(
             cache is not None
@@ -445,6 +449,7 @@ def _install_split_attention_hook(attn: Any) -> bool:
         should_use_2pass = (
             sdpa_2pass_enabled
             and cache is not None
+            and not blockwise_enabled
             and cached_prefix_len is not None
             and cached_prefix_len >= sdpa_2pass_threshold
             and 0 < int(queries.shape[2]) <= sdpa_2pass_max_q
@@ -526,6 +531,7 @@ def _install_split_attention_hook(attn: Any) -> bool:
             dbg_count = int(getattr(self, "_mtplx_route_debug_calls", 0))
             if dbg_count < 8 and int(queries.shape[2]) <= 16:
                 self._mtplx_route_debug_calls = dbg_count + 1
+                dbg_capacity = _kv_cache_capacity(cache)
                 import sys as _sys
 
                 print(
@@ -541,8 +547,8 @@ def _install_split_attention_hook(attn: Any) -> bool:
                     f"packed_should={should_use_gqa_packed} "
                     f"has_uwf={hasattr(cache, 'update_without_fetch')} "
                     f"has_pa={hasattr(cache, 'paged_attention')} "
-                    f"keys_none={getattr(cache, 'keys', None) is None} "
-                    f"cap={0 if getattr(cache, 'keys', None) is None else int(cache.keys.shape[2])} "
+                    f"keys_none={dbg_capacity is None} "
+                    f"cap={dbg_capacity or 0} "
                     f"mask={type(mask).__name__} "
                     f"can_slice={can_slice_mask} "
                     f"twopass={should_use_2pass}",
@@ -859,7 +865,7 @@ def configure_split_full_attention(
         chunk_defaulted = True
     min_prefix = int(threshold if threshold is not None else os.environ.get("MTPLX_SPLIT_FULL_ATTN_THRESHOLD", "1024"))
     stats = {
-        "enabled": bool(active or sdpa_2pass or vllm_metal_paged or gqa_packed),
+        "enabled": bool(active or blockwise or sdpa_2pass or vllm_metal_paged or gqa_packed),
         "split_full_attn_enabled": bool(active),
         "split_full_attn_chunk_size": int(chunk),
         "split_full_attn_chunk_size_was_explicit": bool(chunk_was_explicit),
@@ -896,7 +902,7 @@ def configure_split_full_attention(
         )
         stats["installed"] += int(_install_split_attention_hook(attn))
         attn._mtplx_split_full_attention_enabled = bool(
-            active or sdpa_2pass or vllm_metal_paged or gqa_packed
+            active or blockwise or sdpa_2pass or vllm_metal_paged or gqa_packed
         )
         attn._mtplx_split_full_attention_explicit_enabled = bool(active)
         attn._mtplx_blockwise_full_attention_enabled = bool(blockwise)

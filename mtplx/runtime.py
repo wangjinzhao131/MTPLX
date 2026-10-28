@@ -244,6 +244,10 @@ class MTPLXRuntime:
 
         if not compile_forward_enabled() or not cache:
             return None
+        from .cache_state import BlockOwnedKVCache
+
+        if any(isinstance(entry, BlockOwnedKVCache) for entry in cache):
+            return None
         from .dense_mrope import dense_mrope_state
 
         if dense_mrope_state() is not None:

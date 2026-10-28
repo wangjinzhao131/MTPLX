@@ -27,13 +27,13 @@ export type TabId =
   | "settings";
 
 const TABS: { id: TabId; label: string; icon: typeof Activity }[] = [
-  { id: "overview", label: "Overview", icon: Activity },
-  { id: "speculative", label: "Speculative", icon: Layers },
-  { id: "cache", label: "Cache", icon: Database },
-  { id: "memory", label: "Memory", icon: HardDrive },
-  { id: "thermal", label: "Thermal", icon: Thermometer },
-  { id: "requests", label: "Requests", icon: Sliders },
-  { id: "settings", label: "Settings", icon: Settings },
+  { id: "overview", label: "总览", icon: Activity },
+  { id: "speculative", label: "推测解码", icon: Layers },
+  { id: "cache", label: "缓存", icon: Database },
+  { id: "memory", label: "内存", icon: HardDrive },
+  { id: "thermal", label: "温度与风扇", icon: Thermometer },
+  { id: "requests", label: "请求", icon: Sliders },
+  { id: "settings", label: "设置", icon: Settings },
 ];
 
 type ShellProps = {
@@ -95,7 +95,7 @@ function TopBar({
         <div className="hidden sm:block leading-none">
           <div className="text-sm font-semibold">MTPLX</div>
           <div className="text-[10px] uppercase tracking-widest text-[var(--text-muted)]">
-            Live Dashboard
+            实时监控
           </div>
         </div>
         <div className="hidden md:flex items-center gap-2 ml-4 text-xs text-[var(--text-muted)] min-w-0">
@@ -108,7 +108,7 @@ function TopBar({
           ) : null}
           {activeRequests > 0 ? (
             <span className="px-2 py-0.5 rounded-full bg-[var(--accent)]/15 text-[var(--accent)] text-[10px] uppercase tracking-wider">
-              {activeRequests} in flight
+              {activeRequests} 个处理中
             </span>
           ) : null}
         </div>
@@ -170,7 +170,7 @@ function LeftRail({
         onClick={() => setCollapsed(!collapsed)}
         className="mt-auto mx-2 mb-2 text-[10px] uppercase tracking-widest text-[var(--text-muted)] hover:text-[var(--text-primary)] py-2"
       >
-        {collapsed ? "Expand" : "Collapse"}
+        {collapsed ? "展开" : "收起"}
       </button>
     </nav>
   );

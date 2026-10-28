@@ -20,7 +20,7 @@ export function NewMaxTPSToast() {
             <Trophy className="size-5 text-[var(--accent)]" />
             <div className="leading-tight">
               <div className="text-sm font-semibold text-[var(--text-primary)]">
-                New all-time max
+                刷新历史最高速度
               </div>
               <div className="text-xs text-[var(--text-muted)] tabular-nums">
                 {fmtTokS(newMaxBanner.tok_s)} tok/s

@@ -320,6 +320,11 @@ class SpecDecodeGraphBank:
             return "length_outside_graphbank"
         if cache is None:
             return None
+        from .cache_state import BlockOwnedKVCache
+
+        if any(isinstance(entry, BlockOwnedKVCache) for entry in cache):
+            # shortcut: block offsets/lists are Python state; add a tensor block adapter before compiling.
+            return "block_kv_cache"
         if self.promote_tensor_offsets and not self.allow_python_cache_capture:
             promoted, failures = promote_kv_cache_offsets(cache, reserve_tokens=length)
             self.stats.promoted_cache_entries += promoted
@@ -1423,10 +1428,15 @@ def promote_kv_cache_offsets(
     failures: dict[str, int] = {}
     if cache is None:
         return promoted, failures
+    from .cache_state import BlockOwnedKVCache
+
     if preserve_paged is None:
         preserve_paged = _env_enabled("MTPLX_GRAPHBANK_PRESERVE_PAGED_KV")
     for idx, entry in enumerate(cache):
         if entry is None:
+            continue
+        if isinstance(entry, BlockOwnedKVCache):
+            failures["block_kv_cache"] = failures.get("block_kv_cache", 0) + 1
             continue
         if isinstance(entry, TensorOffsetQSACache):
             continue
@@ -1567,10 +1577,15 @@ def quantized_paged_bank_enabled() -> bool:
 
 def cache_array_tree(cache: Any) -> list[Any]:
     """Return the arrays a compiled closure can legally capture."""
+    from .cache_state import BlockOwnedKVCache
+
     tree: list[Any] = []
     for entry in cache or []:
         if entry is None:
             tree.append(None)
+            continue
+        if isinstance(entry, BlockOwnedKVCache):
+            tree.append([entry.key_blocks, entry.value_blocks])
             continue
         if hasattr(entry, "compile_state"):
             tree.append(getattr(entry, "compile_state"))

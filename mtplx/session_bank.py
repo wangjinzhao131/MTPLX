@@ -9,6 +9,7 @@ the warm result against a cold full prefill before any generation path uses it.
 from __future__ import annotations
 
 import hashlib
+import inspect
 import os
 import sys
 import threading
@@ -27,6 +28,7 @@ from .cache_state import (
     CacheSnapshot,
     _clone_tree,
     _is_trimmable,
+    _restore_state_preserving_container,
     restore_cache,
     snapshot_cache,
     snapshot_cache_lazy_hybrid,
@@ -633,6 +635,42 @@ def _cache_kv_offset(cache: list[Any] | None) -> int | None:
     return None
 
 
+def _native_lease_cache(cache: list[Any] | None) -> bool:
+    """The native B1 cache layouts whose existing lease rewind is supported."""
+    from mlx_lm.models.cache import ArraysCache, KVCache
+    from .cache_state import OwnedRecurrentStateCache
+    from .one_copy import one_copy_enabled
+
+    if not cache or not one_copy_enabled():
+        return False
+    found = False
+    for layer in cache:
+        if type(layer) is KVCache:
+            found = True
+            if any(
+                value is None or value.ndim != 4 or value.shape[0] != 1
+                for value in (layer.keys, layer.values)
+            ):
+                return False
+        elif not isinstance(layer, (ArraysCache, OwnedRecurrentStateCache)):
+            return False
+        if any(getattr(layer, name, None) is not None for name in ("left_padding", "lengths")):
+            return False
+    return found
+
+
+def _native_cache_owned(cache: list[Any] | None) -> bool:
+    return _native_lease_cache(cache) and all(
+        getattr(layer, "_mtplx_native_owned", False) for layer in cache
+    )
+
+
+def _mark_native_cache_owned(cache: list[Any] | None, owned: bool) -> None:
+    for layer in cache or ():
+        if owned or hasattr(layer, "_mtplx_native_owned"):
+            layer._mtplx_native_owned = owned
+
+
 def _lease_advance(entry: Any) -> int | None:
     """Tokens a leased cache ran past its entry: 0, a count, or None if invalid.
 
@@ -744,10 +782,12 @@ def _lease_view_snapshot(entry: Any) -> tuple[CacheSnapshot, CacheSnapshot | Non
     anchor = _lease_rewind_anchor(entry)
     if anchor is None:
         return None
-    snapshot = snapshot_cache_lazy_hybrid(cache)
+    owned = bool(getattr(entry, "native_exclusive", False))
+    snapshot = snapshot_cache(cache) if owned else snapshot_cache_lazy_hybrid(cache)
     if anchor is not False:
         states = tuple(
-            anchored if anchored is not None else state
+            _clone_tree(anchored) if owned and anchored is not None
+            else anchored if anchored is not None else state
             for state, anchored in zip(snapshot.states, anchor[1].states)
         )
         meta = tuple(
@@ -756,7 +796,15 @@ def _lease_view_snapshot(entry: Any) -> tuple[CacheSnapshot, CacheSnapshot | Non
         )
         snapshot = CacheSnapshot(states=states, meta_states=meta)
     mtp_ref = getattr(entry, "mtp_history_cache_ref", None)
-    mtp_snapshot = snapshot_cache_lazy_hybrid(mtp_ref) if mtp_ref is not None else None
+    mtp_snapshot = (
+        (snapshot_cache(mtp_ref) if owned else snapshot_cache_lazy_hybrid(mtp_ref))
+        if mtp_ref is not None else None
+    )
+    if owned:
+        # A borrower must finish owning its buffers before the donor can write.
+        mx.eval(snapshot.states, snapshot.meta_states)
+        if mtp_snapshot is not None:
+            mx.eval(mtp_snapshot.states, mtp_snapshot.meta_states)
     return snapshot, mtp_snapshot
 
 
@@ -853,6 +901,9 @@ class SessionBankEntry:
     # A lease a stopped prefill gave back (return_lease): it has no logits for
     # its last position, so it serves only prompts that extend it.
     extension_only: bool = False
+    native_exclusive: bool = False
+    native_stable_prefix_len: int | None = None
+    _native_preparation: dict[str, Any] | None = field(default=None, repr=False, compare=False)
     # Passive probe: monotonic time this ENTRY OBJECT's cold-tier encode
     # completed (the encode evals the entry's lazy roots in place), or None.
     # Kept on the exact object — Site A and Site B can create distinct
@@ -905,6 +956,7 @@ class SessionBankEntry:
     # history resume at b without a seed re-forward — re-running token b-1
     # would advance recurrent state twice and break exactness.
     gdn_boundaries: list[tuple[int, CacheSnapshot, Any]] = field(default_factory=list)
+    explicit_cache_boundary: int | None = None
     # kvcache-v2: SSD-restored entries defer boundary decode (exact restores
     # never need them); the loader fills gdn_boundaries on first partial use.
     gdn_boundary_loader: Any = None
@@ -914,6 +966,8 @@ class SessionBankEntry:
     # materialized state spans.
     cache_snapshot_prefix_len: int | None = None
     mtp_history_snapshot_prefix_len: int | None = None
+    # Completed SSD blobs, keyed by weak tensor identity; retries hold no bytes.
+    _cold_spill_progress: dict = field(default_factory=dict, repr=False, compare=False)
 
     @property
     def prefix_len(self) -> int:
@@ -948,9 +1002,27 @@ class SessionBankEntry:
 
         self.cache_ref = None
         self.mtp_history_cache_ref = None
+        self._discard_native_preparation()
+
+    def _discard_native_preparation(self) -> None:
+        if self._native_preparation is None:
+            return
+        self._native_preparation = None
+        self.lease_aux_nbytes = (
+            _tree_nbytes(self.logits) + _tree_nbytes(self.hidden)
+            + _tree_nbytes(self.mtp_history_snapshot)
+            + sum(_snapshot_nbytes(r[1]) + _tree_nbytes(r[2]) for r in self.gdn_boundaries)
+        )
+
+    def has_recurrent_boundary(self, position: int | None) -> bool:
+        """Check resident records and the lazy SSD manifest without decoding."""
+        return any(int(record[0]) == position for record in self.gdn_boundaries) or (
+            position in getattr(self.gdn_boundary_loader, "positions", ())
+        )
 
     def _ensure_boundaries_loaded(
-        self, *, should_abort: Callable[[], bool] | None = None
+        self, *, should_abort: Callable[[], bool] | None = None,
+        plan: AnchorPlan | None = None,
     ) -> None:
         """Hydrate the lazily loaded boundary records.
 
@@ -959,30 +1031,44 @@ class SessionBankEntry:
         request interrupts them between records (ColdEncodeInterrupted). The
         loader is put back first, because an entry that lost it would persist
         without boundaries and downgrade its whole lineage on the next
-        restart. Restores pass nothing and are never interrupted.
+        restart. A plan hydrates a bounded inherited set, including when the
+        serving checkpoint is already resident. Restores pass nothing and
+        keep that selected-only fast path.
         """
-        if self.gdn_boundaries or self.gdn_boundary_loader is None:
+        if self.gdn_boundary_loader is None or (self.gdn_boundaries and plan is None):
             return
+        if plan is not None and plan.explicit_cache_boundary is None:
+            plan = replace(plan, explicit_cache_boundary=self.explicit_cache_boundary)
         loader, self.gdn_boundary_loader = self.gdn_boundary_loader, None
         try:
-            if should_abort is None:
-                records = loader()
-            else:
-                try:
-                    records = loader(should_abort=should_abort)
-                except TypeError:
-                    # A loader that predates the interrupt contract.
-                    records = loader()
-            self.gdn_boundaries = [
-                (int(r[0]), r[1], r[2] if len(r) > 2 else None) for r in records or ()
-            ]
+            # Legacy loaders accept no arguments or only should_abort. Inspect
+            # before calling so an internal TypeError never repeats disk work.
+            parameters = inspect.signature(loader).parameters
+            accepts_kwargs = any(p.kind == p.VAR_KEYWORD for p in parameters.values())
+            kwargs = {
+                name: value for name, value in {
+                    "should_abort": should_abort, "plan": plan,
+                    "existing_records": self.gdn_boundaries,
+                }.items() if name in parameters or accepts_kwargs
+            }
+            records = loader(**kwargs)
+            merged = {
+                int(r[0]): (int(r[0]), r[1], r[2] if len(r) > 2 else None)
+                for r in [*(records or ()), *self.gdn_boundaries]
+            }
+            self.gdn_boundaries = (
+                retain_checkpoints(merged.values(), plan)
+                if plan is not None else [merged[p] for p in sorted(merged)]
+            )
         except ColdEncodeInterrupted:
             self.gdn_boundary_loader = loader
             raise
         except Exception:
-            # Fail closed: a missing/corrupt boundary payload just means the
-            # partial-restore path declines, exactly as if none were stored.
-            self.gdn_boundaries = []
+            # Keep the already decoded serving checkpoint on a corrupt older
+            # record; the current restore still has a valid recurrent state.
+            pass
+        if not self.has_recurrent_boundary(self.explicit_cache_boundary):
+            self.explicit_cache_boundary = None
 
     def recurrent_boundary_at_or_below(
         self, matched: int
@@ -1109,6 +1195,7 @@ class SessionBankRestore:
     ssd_cached_tokens: int = 0
     ssd_restore_s: float = 0.0
     extra_state: dict[str, Any] | None = None
+    native_ownership_proven: bool = False
 
 
 class QueuedPersistenceCancelError(RuntimeError):
@@ -1220,6 +1307,9 @@ class SessionBank:
         # dispatch, a cancel, a job the dispatcher dropped): a leaf lock,
         # never held while calling out.
         self._persistence_pending_lock = threading.Lock()
+        # Tool turns defer durability without retaining entry/tensor closures.
+        self._persistence_held: set[str] = set()
+        self._persistence_deferred: dict[str, tuple[tuple[int, ...], int]] = {}
         self.last_restore_source: str | None = None
         self.last_ssd_restore_s: float = 0.0
         self.last_prefix_diagnostic: dict[str, Any] | None = None
@@ -1390,6 +1480,9 @@ class SessionBank:
         hidden: Any | None,
         hidden_variant: str | None = None,
         keep_live_ref: bool = False,
+        prefer_live_ref: bool = False,
+        native_owned: bool = False,
+        native_stable_prefix_len: int | None = None,
         session_id: str | None = None,
         template_hash: str | None = None,
         mtp_history_policy: str | None = None,
@@ -1402,6 +1495,7 @@ class SessionBank:
         nbytes_override: int | None = None,
         extra_state: dict[str, Any] | None = None,
         gdn_boundaries: list[tuple[int, CacheSnapshot]] | None = None,
+        explicit_cache_boundary: int | None = None,
         timing_out: dict[str, Any] | None = None,
         lease_kv_offset: int | None = None,
         lease_mtp_offset: int | None = None,
@@ -1420,6 +1514,8 @@ class SessionBank:
         tokens = tuple(int(token) for token in token_ids)
         if not tokens:
             raise ValueError("cannot store an empty prefix")
+        if type(native_stable_prefix_len) is not int or not 0 < native_stable_prefix_len < len(tokens):
+            native_stable_prefix_len = None
         if mtp_snapshot_epoch is not None and int(mtp_snapshot_epoch) != int(snapshot_epoch):
             raise ValueError("trunk and MTP snapshots must share the same commit boundary")
         self.last_put_nbytes = 0
@@ -1444,7 +1540,10 @@ class SessionBank:
                 file=sys.stderr,
                 flush=True,
             )
-        if not normalized_boundaries:
+        if (
+            not normalized_boundaries or explicit_cache_boundary is None
+            or session_id in self._persistence_held
+        ):
             # Same-key replacement must not lose interior boundaries: the idle
             # postcommit re-put of a prompt-boundary entry (which restores
             # instead of re-prefilling, so it captures none) would otherwise
@@ -1452,13 +1551,8 @@ class SessionBank:
             # RAG-shape turn to a fail-closed cold prefill (found 2026-07-03).
             # Boundaries describe the token prefix, so an identical key keeps
             # them valid.
-            prior = self._entries.get(tokens)
-            if prior is not None and prior.gdn_boundaries:
-                normalized_boundaries = list(prior.gdn_boundaries)
-            inherited_loader = (
-                getattr(prior, "gdn_boundary_loader", None) if prior is not None else None
-            )
-            if not normalized_boundaries and inherited_loader is None:
+            donor = self._entries.get(tokens)
+            if donor is None or not (donor.gdn_boundaries or donor.gdn_boundary_loader):
                 # Prefix-entry inheritance (#121, 2026-07-16): boundary
                 # records describe token PREFIXES, so any stored entry that
                 # is a strict prefix of the new tokens carries records that
@@ -1466,15 +1560,50 @@ class SessionBank:
                 # no PromptState in scope (generation-final commits) would
                 # otherwise store boundary-less entries and push the next
                 # divergent agent turn onto the fail-closed cold path.
-                prefix_donor = self.longest_prefix(tokens)
-                if prefix_donor is not None:
-                    # A loader-backed donor (exact SSD restore after a
-                    # restart) counts too: its records live on disk behind
-                    # the loader, and sharing the loader callable is safe —
-                    # it is a pure re-read of the donor's payload.
-                    normalized_boundaries = list(prefix_donor.gdn_boundaries)
-                    inherited_loader = getattr(
-                        prefix_donor, "gdn_boundary_loader", None
+                donor = self.longest_prefix(tokens)
+            if donor is not None and (
+                not normalized_boundaries or donor.explicit_cache_boundary is not None
+                or native_stable_prefix_len is not None or session_id in self._persistence_held
+            ) and _restore_identity_compatible(
+                donor,
+                model_path=str(runtime.model_path),
+                mtp_enabled=bool(runtime.mtp_enabled),
+                hidden_variant=hidden_variant,
+                template_hash=template_hash,
+                mtp_history_policy=mtp_history_policy,
+                draft_head_identity=draft_head_identity,
+                policy_fingerprint=policy_fingerprint,
+            ):
+                frontier = min(
+                    len(tokens), donor.cache_snapshot_prefix_len or donor.prefix_len
+                )
+                inherited_boundary = donor.explicit_cache_boundary
+                if native_stable_prefix_len is None:
+                    native_stable_prefix_len = donor.native_stable_prefix_len
+                if explicit_cache_boundary is None and (
+                    inherited_boundary is not None and inherited_boundary <= frontier
+                ):
+                    explicit_cache_boundary = inherited_boundary
+                # Price inherited records before admission, not later during
+                # SSD serialization when entry.nbytes has already been set.
+                donor._ensure_boundaries_loaded(plan=AnchorPlan(
+                    budget_bytes=self.checkpoint_budget_bytes,
+                    prompt_end=frontier,
+                    tail_backoff=0,
+                    restore_point=frontier,
+                    ceiling=frontier,
+                    explicit_cache_boundary=explicit_cache_boundary,
+                    stable_prefix=native_stable_prefix_len,
+                ))
+                inherited = [r for r in donor.gdn_boundaries if int(r[0]) <= frontier]
+                if not normalized_boundaries:
+                    normalized_boundaries = inherited
+                else:
+                    present = {int(r[0]) for r in normalized_boundaries}
+                    normalized_boundaries.extend(
+                        r for r in inherited
+                        if int(r[0]) in {explicit_cache_boundary, native_stable_prefix_len}
+                        and int(r[0]) not in present
                     )
         if normalized_boundaries:
             # Every stored set keeps its anchors within the checkpoint budget,
@@ -1487,11 +1616,35 @@ class SessionBank:
                     budget_bytes=self.checkpoint_budget_bytes,
                     prompt_end=len(tokens) - 1,
                     tail_backoff=default_tail_backoff(),
+                    explicit_cache_boundary=explicit_cache_boundary,
+                    stable_prefix=native_stable_prefix_len,
                 ),
             )
+        if (
+            type(native_stable_prefix_len) is not int
+            or not 0 < native_stable_prefix_len < len(tokens)
+            or not any(int(r[0]) == native_stable_prefix_len for r in normalized_boundaries)
+        ):
+            native_stable_prefix_len = None
+        if (
+            type(explicit_cache_boundary) is not int
+            or not 0 < explicit_cache_boundary <= len(tokens)
+            or not any(int(r[0]) == explicit_cache_boundary for r in normalized_boundaries)
+        ):
+            explicit_cache_boundary = None
         def live_ref_entry(reason: str, nbytes: int) -> SessionBankEntry | None:
             if not keep_live_ref or not cache:
                 return None
+            if (
+                native_owned and session_id in self._persistence_held
+                and _native_lease_cache(cache)
+                and (mtp_history_cache_ref is None or _native_lease_cache(mtp_history_cache_ref))
+                and mtp_history_snapshot is None
+            ):
+                # The caller grants this only for a fresh cold cache. Later
+                # publications inherit provenance from these exact containers.
+                _mark_native_cache_owned(cache, True)
+                _mark_native_cache_owned(mtp_history_cache_ref, True)
             # The draft head's committed history (#499). A caller hands it
             # over either as a live reference or as a snapshot, and the
             # server's generation-final commit always uses the snapshot.
@@ -1561,6 +1714,7 @@ class SessionBank:
                 restore_floor_tokens=cache_restore_floor,
                 window_nbytes=cache_window_nbytes,
                 gdn_boundaries=list(normalized_boundaries),
+                explicit_cache_boundary=explicit_cache_boundary,
                 lease_kv_offset=(
                     int(lease_kv_offset)
                     if lease_kv_offset is not None
@@ -1573,7 +1727,20 @@ class SessionBank:
                     if mtp_history_cache_ref is not None
                     else None
                 ),
+                native_exclusive=(
+                    _native_cache_owned(cache)
+                    and kept_mtp_history is None
+                    and (mtp_history_cache_ref is None or _native_cache_owned(mtp_history_cache_ref))
+                ),
+                native_stable_prefix_len=native_stable_prefix_len,
             )
+            if entry.native_exclusive:
+                mx.eval(
+                    [getattr(layer, "state", None) for layer in cache],
+                    [getattr(layer, "state", None) for layer in mtp_history_cache_ref or ()],
+                    entry.logits, entry.hidden, entry.extra_state,
+                    [(record[1].states, record[2]) for record in normalized_boundaries],
+                )
             if reason != "one_copy_lease":
                 self.eviction_log.append(
                     {
@@ -1592,18 +1759,32 @@ class SessionBank:
             self._evict_if_needed(protected_tokens=tokens)
             return entry
 
-        if keep_live_ref and cache and _one_copy_cache(cache):
+        native_live = bool(
+            session_id and (prefer_live_ref or session_id in self._persistence_held)
+            and _native_lease_cache(cache)
+        )
+        if keep_live_ref and cache and (_one_copy_cache(cache) or native_live):
             # One-copy store: the live cache IS the entry. No snapshot views:
             # a view would share the buffers, and the next turn's first write
             # would then copy the whole history instead of writing in place
             # (the 09-29 duplicate that switched the compiled route off).
-            live_entry = live_ref_entry("one_copy_lease", 0)
+            if native_live:
+                for live in cache:
+                    if not _is_trimmable(live):
+                        # Evaluated recurrent slices can still pin a full capture tape.
+                        _restore_state_preserving_container(live, live.state)
+                        mx.eval(live.state)
+            live_entry = live_ref_entry("native_live_lease" if native_live else "one_copy_lease", 0)
             if live_entry is not None:
                 self.last_put_nbytes = int(live_entry.held_nbytes)
                 if timing_out is not None:
                     timing_out["one_copy_lease"] = True
                 self._schedule_live_ref_spill(live_entry)
                 return live_entry
+        if _native_cache_owned(cache):
+            # A snapshot publication lends these buffers, ending exclusive provenance.
+            _mark_native_cache_owned(cache, False)
+            _mark_native_cache_owned(mtp_history_cache_ref, False)
         if nbytes_override is not None and int(nbytes_override) > self.per_session_max_bytes:
             self.last_put_nbytes = int(nbytes_override)
             self.last_put_skipped_oversized_snapshot = True
@@ -1635,6 +1816,14 @@ class SessionBank:
             snapshot = (
                 snapshot_cache_lazy_hybrid(cache) if lazy_kv else snapshot_cache(cache)
             )
+            if keep_live_ref:
+                # Retire producer graphs before retaining live caches; KV views still share storage.
+                mx.eval(snapshot.states, snapshot.meta_states)
+                for live, saved in zip(cache, snapshot.states):
+                    if saved is not None and not _is_trimmable(live):
+                        # A recurrent time slice can pin the whole capture tape.
+                        _restore_state_preserving_container(live, saved)
+                        mx.eval(live.state)
         except RuntimeError as exc:
             if "materialize active K/V arrays" not in str(exc):
                 raise
@@ -1679,7 +1868,8 @@ class SessionBank:
             and entry_nbytes > self.per_session_max_bytes
         ):
             kept, shed_nbytes, shed = self._shed_boundaries_to_fit(
-                normalized_boundaries, entry_nbytes
+                normalized_boundaries, entry_nbytes,
+                explicit_cache_boundary=explicit_cache_boundary,
             )
             # Only apply a shed that actually rescues the entry. When the BASE
             # snapshot alone is over budget, dropping records changes nothing
@@ -1687,6 +1877,8 @@ class SessionBank:
             # the unchanged refusal below report the real size.
             if shed and shed_nbytes <= self.per_session_max_bytes:
                 normalized_boundaries, entry_nbytes = kept, shed_nbytes
+                if not any(int(r[0]) == explicit_cache_boundary for r in kept):
+                    explicit_cache_boundary = None
                 self.boundary_shed_puts += 1
                 self.boundary_shed_records += shed
                 self.eviction_log.append(
@@ -1753,9 +1945,7 @@ class SessionBank:
             restore_floor_tokens=cache_restore_floor,
             window_nbytes=cache_window_nbytes,
             gdn_boundaries=list(normalized_boundaries),
-            gdn_boundary_loader=(
-                inherited_loader if not normalized_boundaries else None
-            ),
+            explicit_cache_boundary=explicit_cache_boundary,
         )
         if timing_out is not None:
             timing_out["entry_build_s"] = time.perf_counter() - trunk_snapshot_done
@@ -2048,19 +2238,16 @@ class SessionBank:
                 and int(_entry.mtp_snapshot_epoch) != int(_entry.snapshot_epoch)
             ):
                 continue
+            _achievable = _cand
             if _entry.has_recurrent:
-                _gap = int(_entry.prefix_len) - _cand
-                if _gap > gap_limit:
-                    _probe = getattr(
-                        _entry, "recurrent_boundary_at_or_below", None
-                    )
-                    _achievable = 0
-                    if callable(_probe):
-                        _boundary = _probe(_cand)
-                        if _boundary is not None:
-                            _achievable = int(_boundary[0])
-                    if _achievable <= floor:
-                        continue
+                _probe = getattr(_entry, "recurrent_boundary_at_or_below", None)
+                _achievable = 0
+                if callable(_probe):
+                    _boundary = _probe(_cand)
+                    if _boundary is not None:
+                        _achievable = int(_boundary[0])
+                if _achievable <= floor:
+                    continue
             if resident_duplicates is None:
                 resident_duplicates = {}
             resident_duplicates[str(_entry.token_hash)] = {
@@ -2073,11 +2260,11 @@ class SessionBank:
             # never suppress a valid cold hydration
             # (test_identity_incompatible_higher_ram_match_does_not_shadow_valid_cold).
             serve_compatible_best_matched = max(
-                serve_compatible_best_matched, _cand
+                serve_compatible_best_matched, _achievable
             )
         # The best SERVE-COMPATIBLE RAM match is the bar a cold candidate
-        # must beat: the stable sort below picks max (matched, prefix_len),
-        # so a cold row with strictly smaller matched can never win against
+        # must beat: sort by recoverable tokens before raw match length,
+        # so a cold row with strictly smaller reach cannot win against
         # an entry that can actually serve this request — hydrating it (a
         # multi-GB disk read + decode on the request thread) is pure waste.
         # The bar deliberately ignores incompatible/lease-only RAM entries
@@ -2115,7 +2302,14 @@ class SessionBank:
         )
         if cold_match is not None:
             matches.append(cold_match)
-        matches.sort(key=lambda item: (item[1], item[0].prefix_len), reverse=True)
+        matches.sort(
+            key=lambda item: (
+                _recurrent_restore_point(item[0], item[1])
+                if item[0].has_recurrent else item[1],
+                item[1], item[0].prefix_len,
+            ),
+            reverse=True,
+        )
         if matches:
             entry, matched = matches[0]
             cache_source = str(getattr(entry, "cache_source", "ram") or "ram")
@@ -2226,6 +2420,7 @@ class SessionBank:
             ),
             gdn_boundaries=list(getattr(record, "gdn_boundaries", None) or []),
             gdn_boundary_loader=getattr(record, "gdn_boundary_loader", None),
+            explicit_cache_boundary=getattr(record, "explicit_cache_boundary", None),
             model_path=str(metadata.get("model_path") or model_path),
             mtp_enabled=bool(metadata.get("mtp_enabled", mtp_enabled)),
             hidden_variant=metadata.get("hidden_variant"),
@@ -2321,6 +2516,7 @@ class SessionBank:
         policy_fingerprint: str | None = None,
         cache_factory: Callable[[], list[Any]] | None = None,
         mtp_cache_factory: Callable[[], list[Any]] | None = None,
+        required_boundary: int | None = None,
     ) -> SessionBankRestore | None:
         mode = str(mode).replace("-", "_")
         if mode == "reference_lease":
@@ -2361,6 +2557,7 @@ class SessionBank:
                 draft_head_identity=draft_head_identity,
                 policy_fingerprint=policy_fingerprint,
                 ram_refusal=ram_refusal,
+                required_boundary=required_boundary,
             )
 
         entry = self.longest_prefix(token_ids)
@@ -2405,7 +2602,18 @@ class SessionBank:
             # position: it serves prompts that extend it, never its own.
             self.last_miss_reason = CacheMissReason.NO_SNAPSHOT_COVERAGE.value
             return cold_fallback()
+        if (
+            required_boundary is not None
+            and entry.has_recurrent
+            and 0 < required_boundary < entry.prefix_len
+            and not entry.has_recurrent_boundary(required_boundary)
+        ):
+            self.last_miss_reason = "explicit_cache_boundary_missing"
+            return cold_fallback()
         actual_restore_mode = "clone"
+        native_ownership_proven = self.native_lease_can_extend(
+            entry, session_id=session_id, token_ids=token_ids
+        )
         rewind_anchor: Any = False
         # A lease is taken in place only by its own conversation; any other
         # request is served a copy of it (``_lease_owned_by``).
@@ -2450,6 +2658,7 @@ class SessionBank:
                 self.last_miss_reason = CacheMissReason.NO_SNAPSHOT_COVERAGE.value
                 return cold_fallback()
             entry.cache_ref = None
+            entry._discard_native_preparation()
             self._release_shared_leases(cache, keep=entry)
             trimmed = _trim_cache_ref_to_tokens(cache, target)
             if not trimmed:
@@ -2546,6 +2755,7 @@ class SessionBank:
             mtp_history_cache=mtp_history_cache,
             cache_source="ram",
             extra_state=_clone_tree(entry.extra_state),
+            native_ownership_proven=(native_ownership_proven and take_lease),
         )
 
     def restore_entry_prefix_cache(
@@ -2735,6 +2945,7 @@ class SessionBank:
                 self.last_miss_reason = CacheMissReason.NO_SNAPSHOT_COVERAGE.value
                 return None
             entry.cache_ref = None
+            entry._discard_native_preparation()
             self._release_shared_leases(cache, keep=entry)
             _trim_started = time.perf_counter()
             trimmed = (
@@ -2861,6 +3072,19 @@ class SessionBank:
             self.last_miss_reason = CacheMissReason.NO_SNAPSHOT_COVERAGE.value
             return None
 
+        if (
+            entry.lazy_kv
+            and not entry.live_ref_only
+            and not (take_lease and getattr(entry, "snapshot_settled_at", None))
+        ):
+            # Trim only changes the offset; narrow shared native KV before COW.
+            # Eager copies and sole-owner leases can instead donate their buffer.
+            from mlx_lm.models.cache import KVCache
+
+            for layer in cache:
+                if type(layer) is KVCache and layer.keys is not None:
+                    layer.state = layer.state
+
         if served_out is not None:
             served_out["restore_point"] = int(restore_point)
             served_out["boundary_used"] = boundary_snapshot is not None
@@ -2877,12 +3101,15 @@ class SessionBank:
         # Cleared entries let go of their live caches like evicted ones do
         # (see _evict_entry): /admin/cache/clear and the admission shed's
         # superseded-session clear are both expected to give memory back.
+        # A request's persistence hold outlives admission reclaiming its entries.
         if session_id is None:
+            self._persistence_deferred.clear()
             count = len(self._entries)
             for entry in list(self._entries.values()):
                 entry.release_live_refs()
             self._entries.clear()
             return count
+        self._persistence_deferred.pop(session_id, None)
         victims = [
             tokens
             for tokens, entry in self._entries.items()
@@ -2990,6 +3217,197 @@ class SessionBank:
             "eviction_log": list(self.eviction_log)[-16:],
         }
 
+    def native_live_ref_enabled(self, cache: list[Any], *, session_id: str | None) -> bool:
+        return session_id in self._persistence_held and _native_lease_cache(cache)
+
+    def native_lease_can_extend(
+        self, entry: SessionBankEntry, *, session_id: str | None,
+        token_ids: list[int] | tuple[int, ...],
+    ) -> bool:
+        """Owner-lane eligibility; callers must not treat a preflight as a transfer."""
+        tokens = tuple(int(token) for token in token_ids)
+        return bool(
+            len(tokens) > entry.prefix_len and tokens[:entry.prefix_len] == entry.token_ids
+            and self._native_lease_owned(entry, session_id=session_id)
+        )
+
+    def _native_lease_owned(self, entry: SessionBankEntry, *, session_id: str | None) -> bool:
+        advance = _lease_advance(entry)
+        anchor = _lease_rewind_anchor(entry)
+        if (
+            not session_id or session_id not in self._persistence_held
+            or entry.session_id != session_id
+            or self._entries.get(entry.token_ids) is not entry
+            or not entry.live_ref_only or not entry.native_exclusive
+            or not _native_cache_owned(entry.cache_ref)
+            or _snapshot_nbytes(entry.cache_snapshot)
+            or entry.mtp_history_snapshot is not None
+            or entry.lease_kv_offset != entry.prefix_len or advance is None or anchor is None
+            or any(
+                int(getattr(layer, "offset", -1)) != entry.prefix_len + advance
+                for layer in entry.cache_ref if _is_trimmable(layer)
+            )
+            or (
+                entry.mtp_history_cache_ref is not None
+                and (
+                    entry.lease_mtp_offset is None
+                    or not 0 <= entry.lease_mtp_offset <= entry.prefix_len - 1
+                    or _cache_kv_offset(entry.mtp_history_cache_ref) != entry.lease_mtp_offset + advance
+                    or (advance and anchor[2] is None)
+                )
+            )
+            or (
+                entry.mtp_snapshot_epoch is not None
+                and (entry.mtp_snapshot_epoch != entry.snapshot_epoch
+                     or not _native_cache_owned(entry.mtp_history_cache_ref))
+            )
+        ):
+            return False
+        if any(
+            other is not entry and other.session_id == session_id
+            and (
+                other.cache_ref is not None or _snapshot_nbytes(other.cache_snapshot)
+                or other.mtp_history_cache_ref is not None
+                or other.mtp_history_snapshot is not None
+            )
+            for other in self._entries.values()
+        ):
+            return False
+        with self._persistence_pending_lock:
+            return not any(
+                (pending := ref()) is not None and pending.session_id == session_id
+                for ref in self._persistence_pending.values()
+            )
+
+    def prepare_native_continuation(
+        self, *, session_id: str, token_ids: list[int] | tuple[int, ...],
+    ) -> SessionBankEntry | None:
+        """On the owner lane, rekey a divergent tool turn only at its trusted anchor."""
+        tokens = tuple(int(token) for token in token_ids)
+        for entry in list(self._entries.values()):
+            if entry.session_id == session_id:
+                self._restore_native_preparation(entry)
+            if not self._native_lease_owned(entry, session_id=session_id):
+                continue
+            if tokens[:entry.prefix_len] == entry.token_ids:
+                return entry
+            boundary = entry.native_stable_prefix_len
+            if (
+                boundary is None or not 0 < boundary < entry.prefix_len
+                or len(tokens) <= boundary or tokens[:boundary] != entry.token_ids[:boundary]
+                or _lease_advance(entry) != 0 or entry.extra_state is not None
+                or entry.token_ids[:boundary] in self._entries
+            ):
+                return None
+            anchor = entry.recurrent_boundary_at_or_below(boundary)
+            mtp = entry.mtp_history_cache_ref
+            if (
+                anchor is None or int(anchor[0]) != boundary
+                or (mtp is not None and (
+                    anchor[2] is None or _cache_kv_offset(mtp) != entry.prefix_len - 1
+                ))
+            ):
+                return None
+            # Only metadata/recurrent anchors are retained for a refused request;
+            # their original auxiliary bill stays until rollback or actual take.
+            entry._native_preparation = {
+                name: getattr(entry, name) for name in (
+                    "token_ids", "token_hash", "logits", "hidden", "extension_only",
+                    "lease_kv_offset", "lease_mtp_offset", "snapshot_epoch",
+                    "mtp_snapshot_epoch", "gdn_boundaries", "explicit_cache_boundary",
+                    "lease_aux_nbytes",
+                )
+            }
+            del self._entries[entry.token_ids]
+            entry.token_ids = entry.token_ids[:boundary]
+            entry.token_hash = token_prefix_hash(entry.token_ids)
+            entry.logits = None
+            entry.hidden = anchor[2]
+            entry.extension_only = True
+            entry.lease_kv_offset = boundary
+            entry.lease_mtp_offset = boundary - 1 if mtp is not None else None
+            entry.snapshot_epoch = boundary
+            entry.mtp_snapshot_epoch = boundary if mtp is not None else None
+            entry.gdn_boundaries = [record for record in entry.gdn_boundaries if int(record[0]) <= boundary]
+            if entry.explicit_cache_boundary is not None and entry.explicit_cache_boundary > boundary:
+                entry.explicit_cache_boundary = None
+            self._entries[entry.token_ids] = entry
+            self._defer_session_persistence(entry)
+            return entry
+        return None
+
+    def _restore_native_preparation(self, entry: SessionBankEntry) -> bool:
+        original = entry._native_preparation
+        if (
+            original is None or self._entries.get(entry.token_ids) is not entry
+            or entry.cache_ref is None
+            or original["token_ids"] in self._entries
+            or _cache_kv_offset(entry.cache_ref) != original["lease_kv_offset"]
+            or (
+                entry.mtp_history_cache_ref is not None
+                and _cache_kv_offset(entry.mtp_history_cache_ref) != original["lease_mtp_offset"]
+            )
+        ):
+            return False
+        del self._entries[entry.token_ids]
+        for name, value in original.items():
+            setattr(entry, name, value)
+        entry._native_preparation = None
+        self._entries[entry.token_ids] = entry
+        self._defer_session_persistence(entry)
+        return True
+
+    def hold_session_persistence(self, session_id: str) -> None:
+        """Hold this session's durability work; call on the model owner."""
+        if not session_id:
+            return
+        self._persistence_held.add(session_id)
+        entries = [
+            entry for entry in self._entries.values()
+            if entry.session_id == session_id
+        ]
+        if entries:
+            latest = max(entries, key=lambda entry: entry.created_at_s)
+            self._defer_session_persistence(latest)
+        with self._persistence_pending_lock:
+            pending = [ref() for ref in self._persistence_pending.values()]
+        self._cancel_queued_persistence({
+            id(entry) for entry in [*entries, *pending]
+            if entry is not None and entry.session_id == session_id
+        })
+
+    def _defer_session_persistence(self, entry: SessionBankEntry) -> bool:
+        if entry.session_id not in self._persistence_held:
+            return False
+        if any(
+            other.session_id == entry.session_id and other.created_at_s > entry.created_at_s
+            for other in self._entries.values()
+        ):
+            return True
+        self._persistence_deferred[entry.session_id] = (
+            entry.token_ids, int(entry.snapshot_epoch)
+        )
+        return True
+
+    def release_session_persistence(self, session_id: str) -> bool:
+        """Queue the latest surviving held entry on the model-owner idle lane."""
+        self._persistence_held.discard(session_id)
+        deferred = self._persistence_deferred.pop(session_id, None)
+        if deferred is None:
+            return False
+        token_ids, epoch = deferred
+        entry = self._entries.get(token_ids)
+        if (
+            entry is None or entry.session_id != session_id
+            or int(entry.snapshot_epoch) != epoch
+        ):
+            return False
+        self._restore_native_preparation(entry)
+        if entry.lazy_kv:
+            self._schedule_snapshot_settle(entry)
+        self._enqueue_cold_entry(entry)
+        return True
+
     def _schedule_snapshot_settle(
         self,
         entry: SessionBankEntry,
@@ -3005,6 +3423,8 @@ class SessionBank:
         request that lands mid-settle waiting at most one array (~10 ms),
         not the whole snapshot.
         """
+        if self._defer_session_persistence(entry):
+            return
         if entry.live_ref_only or not _snapshot_settle_enabled():
             return
         dispatch = self.cold_enqueue_dispatch
@@ -3095,6 +3515,10 @@ class SessionBank:
         entry: SessionBankEntry,
         timing_out: dict[str, Any] | None = None,
     ) -> None:
+        if self._defer_session_persistence(entry):
+            if timing_out is not None:
+                timing_out["cold_enqueue"] = {"deferred": True, "skip_reason": "session_hold"}
+            return
         cold: dict[str, Any] | None = None
         if timing_out is not None:
             cold = {}
@@ -3186,7 +3610,16 @@ class SessionBank:
             except Exception:
                 should_abort = None
         try:
-            entry._ensure_boundaries_loaded(should_abort=should_abort)
+            entry._ensure_boundaries_loaded(
+                should_abort=should_abort,
+                plan=AnchorPlan(
+                    budget_bytes=self.checkpoint_budget_bytes,
+                    prompt_end=entry.prefix_len - 1,
+                    ceiling=entry.cache_snapshot_prefix_len or entry.prefix_len,
+                    restore_point=entry.cache_snapshot_prefix_len,
+                    explicit_cache_boundary=entry.explicit_cache_boundary,
+                ),
+            )
         except ColdEncodeInterrupted:
             note = getattr(self.cold_tier, "note_encode_yield", None)
             if callable(note):
@@ -3196,6 +3629,8 @@ class SessionBank:
     def _cold_enqueue_job(
         self, entry: SessionBankEntry, put_entry: Callable[..., Any]
     ) -> None:
+        if self._defer_session_persistence(entry):
+            return
         # The tier serializes only MATERIALIZED boundary records. An entry
         # whose records still sit behind the lazy loader (inherited from an
         # SSD-restored donor) would persist a boundary-less package and
@@ -3275,6 +3710,8 @@ class SessionBank:
         tensor-by-tensor. Without an idle dispatcher there is no safe
         window for the encode, so the skip is recorded, not silent.
         """
+        if self._defer_session_persistence(entry):
+            return
         cold = self.cold_tier
         if cold is None or not callable(getattr(cold, "spill_entry", None)):
             return
@@ -3319,6 +3756,8 @@ class SessionBank:
         entry = self._entries.get(tuple(int(token) for token in token_ids))
         if entry is None or not entry.live_ref_only or entry.cache_ref is None:
             return False
+        if self._defer_session_persistence(entry):
+            return False
         if int(entry.snapshot_epoch) != int(snapshot_epoch):
             # Superseded: the newer commit scheduled its own (coalesced) job.
             return False
@@ -3336,6 +3775,10 @@ class SessionBank:
                 }
             )
             return False
+        # Persistence may lend views to a tier; conservatively end provenance.
+        entry.native_exclusive = False
+        _mark_native_cache_owned(entry.cache_ref, False)
+        _mark_native_cache_owned(entry.mtp_history_cache_ref, False)
         cold = self.cold_tier
         spill = getattr(cold, "spill_entry", None) if cold is not None else None
         if not callable(spill):
@@ -3419,6 +3862,7 @@ class SessionBank:
         draft_head_identity: str | None,
         policy_fingerprint: str | None,
         ram_refusal: dict[str, Any] | None = None,
+        required_boundary: int | None = None,
     ) -> SessionBankRestore | None:
         # ram_refusal: restore() refused this lookup's longest RAM prefix
         # (ram_miss_reason, ram_refused_prefix_len, ram_refused_session_id).
@@ -3448,6 +3892,7 @@ class SessionBank:
             mtp_history_policy=mtp_history_policy,
             draft_head_identity=draft_head_identity,
             policy_fingerprint=policy_fingerprint,
+            **({"required_boundary": required_boundary} if required_boundary is not None else {}),
         )
         if record is None:
             # Read the miss reason through the cheap accessor: stats() is the
@@ -3489,6 +3934,7 @@ class SessionBank:
             ),
             gdn_boundaries=list(getattr(record, "gdn_boundaries", None) or []),
             gdn_boundary_loader=getattr(record, "gdn_boundary_loader", None),
+            explicit_cache_boundary=getattr(record, "explicit_cache_boundary", None),
             model_path=str(metadata.get("model_path") or runtime.model_path),
             mtp_enabled=bool(metadata.get("mtp_enabled", runtime.mtp_enabled)),
             hidden_variant=metadata.get("hidden_variant"),
@@ -3518,6 +3964,14 @@ class SessionBank:
             and int(entry.mtp_snapshot_epoch) != int(entry.snapshot_epoch)
         ):
             self.last_miss_reason = CacheMissReason.SNAPSHOT_DESYNC.value
+            return None
+        if (
+            required_boundary is not None
+            and entry.has_recurrent
+            and 0 < required_boundary < entry.prefix_len
+            and not entry.has_recurrent_boundary(required_boundary)
+        ):
+            self.last_miss_reason = "explicit_cache_boundary_missing"
             return None
         cache = runtime.make_cache()
         restore_cache(cache, entry.cache_snapshot)
@@ -3629,7 +4083,7 @@ class SessionBank:
         a cache the one-copy store does not keep.
         """
 
-        if not _one_copy_cache(cache):
+        if not (_one_copy_cache(cache) or (source.live_ref_only and _native_lease_cache(cache))):
             return None
         position = int(anchor[0])
         if position != len(token_ids):
@@ -3646,6 +4100,7 @@ class SessionBank:
             hidden=anchor[2],
             hidden_variant=source.hidden_variant,
             keep_live_ref=True,
+            prefer_live_ref=True,
             session_id=source.session_id,
             template_hash=source.template_hash,
             mtp_history_policy=source.mtp_history_policy,
@@ -3655,6 +4110,7 @@ class SessionBank:
             snapshot_epoch=position,
             mtp_snapshot_epoch=position if mtp_history_cache is not None else None,
             gdn_boundaries=[*kept, anchor],
+            explicit_cache_boundary=source.explicit_cache_boundary,
             lease_kv_offset=int(kv_offset),
             lease_mtp_offset=mtp_offset,
         )
@@ -3798,14 +4254,16 @@ class SessionBank:
         self,
         boundaries: list[tuple[int, CacheSnapshot, Any]],
         entry_nbytes: int,
+        *,
+        explicit_cache_boundary: int | None = None,
     ) -> tuple[list[tuple[int, CacheSnapshot, Any]], int, int]:
         """Drop boundary records until the entry fits its per-session budget.
 
         Returns ``(kept, nbytes, shed_count)``. ``kept`` keeps the input's
         ascending-position ordering, so callers see the same shape they passed.
 
-        Records are dropped FURTHEST-FROM-THE-TAIL first, and the newest record
-        is never dropped while any is kept. That is deliberately not
+        The explicit boundary is kept last; other records are dropped
+        FURTHEST-FROM-THE-TAIL first. That is deliberately not
         ``checkpoint_anchors.retain_checkpoints``'s policy, which preserves
         deep-divergence anchors (the grid): under byte pressure the anchor is
         the first thing that has to go, because agent divergence concentrates
@@ -3832,8 +4290,12 @@ class SessionBank:
         # kept/kept_sizes are sorted ascending by position (put normalizes
         # them), so index 0 is the record furthest from the tail.
         while kept and total > budget:
-            total -= kept_sizes.pop(0)
-            kept.pop(0)
+            index = next(
+                (i for i, record in enumerate(kept) if int(record[0]) != explicit_cache_boundary),
+                0,
+            )
+            total -= kept_sizes.pop(index)
+            kept.pop(index)
             shed += 1
         return kept, int(total), int(shed)
 
@@ -4128,7 +4590,14 @@ class SessionBank:
             )
             if candidate is not None:
                 matches.append((entry, candidate))
-        matches.sort(key=lambda item: (item[1], item[0].prefix_len), reverse=True)
+        matches.sort(
+            key=lambda item: (
+                _recurrent_restore_point(item[0], item[1])
+                if item[0].has_recurrent else item[1],
+                item[1], item[0].prefix_len,
+            ),
+            reverse=True,
+        )
         # First lane: only a candidate that beats the exact prefix (tried
         # when the exact prefix is shorter than the prompt). Last lane: any
         # candidate, reached only when the exact restore does not serve.
@@ -4405,6 +4874,9 @@ class SessionBank:
 
         def job() -> Any:
             self._retire_persistence_pending(key, entry_ref)
+            current = entry_ref()
+            if current is not None and self._defer_session_persistence(current):
+                return None
             return body()
 
         job.coalesce_key = key
@@ -4886,6 +5358,7 @@ class SessionBank:
         reason: str = "prefill_admission_chain",
         protect_keys: Any = None,
         protect_session_ids: Any = None,
+        allow_terminal: bool = True,
     ) -> tuple[int, int]:
         """Escalating eviction for the admission shed (#447).
 
@@ -4900,15 +5373,16 @@ class SessionBank:
 
         Phase 1 walks non-terminal entries (any session keeps its highest
         ``prefix_len`` entry — the one the protected-terminal order guards).
-        Phase 2, only if the deficit stands, takes remaining entries in the
-        take-anything order of real memory pressure (active sessions last).
+        Phase 2, when allow_terminal and the deficit stands, takes remaining
+        entries in real-pressure order (active sessions last). Soft-headroom
+        admission disables it to keep each waiting conversation's last state.
         Both phases spare the entries the imminent prompt may restore from
         (``protect_tokens``, validated by ``restore_source_keys``: the exact
         prefix and the best block-restorable entry; an entry that shares one
         token with the prompt is not a restore source), and
-        every eviction is RAM-only: the SSD cold tier still restores a walked
-        entry, so the worst case is a disk read on some session's next turn,
-        not this request's abort. ``protect_keys`` adds the caller's own
+        published SSD copies remain available after RAM eviction. Pending SSD
+        writes can be cancelled, so a terminal eviction without a published
+        copy forces that conversation's next turn to prefill cold. ``protect_keys`` adds the caller's own
         restore plan (validated with the request's identity) and
         ``protect_session_ids`` spares every session that is generating or
         being released: the walk took their snapshots too.
@@ -4993,7 +5467,7 @@ class SessionBank:
                 entry.created_at_s,
             ),
         )
-        if self.total_nbytes <= target:
+        if self.total_nbytes <= target or not allow_terminal:
             return _done(non_terminal, 0)
 
         active = self._active_session_ids()

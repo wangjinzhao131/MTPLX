@@ -1,6 +1,7 @@
 """GPU checks: ./python -m unittest discover -s tests -p test_moe_kernel.py."""
 
 import unittest
+from unittest.mock import patch
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -94,6 +95,60 @@ class MoEKernelTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 gate_up(*changed)
 
+    def test_sorted_prefill_reuses_projection_and_clears_hub(self):
+        mx.random.seed(43)
+        model = half_model()
+        self.addCleanup(fuse_projections(model))
+        self.addCleanup(apply(model))
+        module = model.layers[0].mlp.switch_mlp
+        hub = module.gate_proj._fusion
+        for width in (32, 64, 128, 512):
+            with self.subTest(width=width):
+                x = mx.random.normal((1, width, 512), dtype=mx.float16)[..., ::2]
+                indices = mx.array([[[3, 0], [1, 1], [0, 2], [2, 3]]] * (width // 4), dtype=mx.uint32)
+                indices = indices.reshape(1, width, 2)
+                expected = SwitchGLU.__call__(module, x, indices)
+                module.gate_proj(x[:, :1, None, None, :], indices[:, :1])
+                self.assertIsNotNone(hub.outputs)
+                with patch.object(hub, "projection", wraps=hub.projection) as projection:
+                    actual = module(x, indices)
+                    projection.assert_called_once()
+                    self.assertTrue(projection.call_args.kwargs["sorted_indices"])
+                self.assertEqual(actual.shape, expected.shape)
+                self.assertEqual(actual.dtype, expected.dtype)
+                self.assertTrue(mx.array_equal(actual, expected).item())
+                self.assertIsNone(hub.outputs)
+                self.assertIsNone(hub.input)
+                self.assertIsNone(hub.indices)
+                self.assertEqual(hub.served, 0)
+
+    def test_sorted_prefill_fallback_dispatch(self):
+        model = half_model()
+        self.addCleanup(fuse_projections(model))
+        self.addCleanup(apply(model))
+        module = model.layers[0].mlp.switch_mlp
+        for shape, indices_shape, dtype, index_dtype, training in (
+            ((1, 31, 256), (1, 31, 2), mx.float16, mx.uint32, None),
+            ((2, 32, 256), (2, 32, 2), mx.float16, mx.uint32, None),
+            ((32, 256), (32, 2), mx.float16, mx.uint32, None),
+            ((1, 32, 256), (1, 32, 2), mx.float32, mx.uint32, None),
+            ((1, 32, 256), (1, 32, 2), mx.float16, mx.int32, None),
+            ((1, 32, 256), (32, 2), mx.float16, mx.uint32, None),
+            ((1, 32, 256), (1, 64, 2), mx.float16, mx.uint32, None),
+            ((1, 3, 256), (1, 3, 64), mx.float16, mx.uint32, None),
+            ((1, 32, 256), (1, 32, 2), mx.float16, mx.uint32, "self"),
+            ((1, 32, 256), (1, 32, 2), mx.float16, mx.uint32, "gate_proj"),
+            ((1, 32, 256), (1, 32, 2), mx.float16, mx.uint32, "up_proj"),
+        ):
+            with self.subTest(shape=shape, dtype=dtype, index_dtype=index_dtype, training=training):
+                module.eval()
+                if training is not None:
+                    (module if training == "self" else getattr(module, training)).train()
+                x, indices = mx.zeros(shape, dtype=dtype), mx.zeros(indices_shape, dtype=index_dtype)
+                with patch.object(SwitchGLU, "__call__", return_value=object()) as native_call:
+                    self.assertIs(module(x, indices), native_call.return_value)
+                    native_call.assert_called_once_with(module, x, indices)
+
     def test_model_prefill_decode_cache_compile_and_undo(self):
         mx.random.seed(41)
         reference, candidate = half_model(), half_model()
@@ -118,10 +173,15 @@ class MoEKernelTests(unittest.TestCase):
                 undo_ref = compile_decode(reference) if compiled else lambda: None
                 undo_opt = compile_decode(candidate) if compiled else lambda: None
                 try:
-                    sessions = [(reference.make_cache(), candidate.make_cache()) for _ in range(2)]
-                    for session, (ref_cache, opt_cache) in enumerate(sessions):
-                        prompt = mx.array([[1, 2, 3 + session]])
+                    widths = (3, 64, 512)
+                    sessions = [(reference.make_cache(), candidate.make_cache()) for _ in widths]
+                    for width, (ref_cache, opt_cache) in zip(widths, sessions):
+                        prompt = (mx.arange(width) % reference.args.text_config["vocab_size"])[None, :]
                         self.assertTrue(mx.array_equal(reference(prompt, ref_cache), candidate(prompt, opt_cache)).item())
+                        for ref_entry, opt_entry in zip(ref_cache, opt_cache):
+                            self.assertEqual(opt_entry.meta_state, ref_entry.meta_state)
+                            for ref_state, opt_state in zip(ref_entry.state, opt_entry.state):
+                                self.assertTrue(mx.array_equal(opt_state, ref_state).item())
                     for ref_cache, opt_cache in sessions:
                         token = mx.array([[5]])
                         for step in range(5):

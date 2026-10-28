@@ -14,16 +14,16 @@ import { useDashboardStore } from "../state/store";
 type Slice = { key: string; label: string; color: string; description: string };
 
 const SLICES: Slice[] = [
-  { key: "verify_forward_time_s", label: "verify forward", color: "rgba(0,214,143,0.85)", description: "Forward pass through the verify graph (target model)" },
-  { key: "verify_logits_eval_time_s", label: "logits eval", color: "rgba(79,182,243,0.85)", description: "Logits evaluation against MTP draft tokens" },
-  { key: "verify_hidden_eval_time_s", label: "hidden eval", color: "rgba(155,118,233,0.85)", description: "Hidden-state evaluation for downstream cache writes" },
-  { key: "verify_target_distribution_time_s", label: "target dist", color: "rgba(245,158,11,0.85)", description: "Target distribution computation (probability ratio)" },
-  { key: "verify_eval_unattributed_time_s", label: "unattributed", color: "rgba(244,114,182,0.75)", description: "Unaccounted-for eval cost; ideally near zero" },
-  { key: "accept_time_s", label: "accept", color: "rgba(0,214,143,0.55)", description: "Acceptance sampling + residual correction" },
-  { key: "repair_time_s", label: "repair", color: "rgba(239,68,68,0.85)", description: "Repair pass after rejection (lazy when 0)" },
-  { key: "snapshot_time_s", label: "snapshot", color: "rgba(200,210,220,0.45)", description: "Cache snapshot/restore" },
-  { key: "capture_commit_time_s", label: "capture/commit", color: "rgba(0,214,143,0.35)", description: "Capture-commit verifier overhead" },
-  { key: "rollback_time_s", label: "rollback", color: "rgba(240,88,106,0.55)", description: "State rollback after reject" },
+  { key: "verify_forward_time_s", label: "验证前向计算", color: "rgba(0,214,143,0.85)", description: "目标模型验证图的前向计算" },
+  { key: "verify_logits_eval_time_s", label: "logits 求值", color: "rgba(79,182,243,0.85)", description: "对 MTP 草稿 token 进行 logits 求值" },
+  { key: "verify_hidden_eval_time_s", label: "隐藏状态求值", color: "rgba(155,118,233,0.85)", description: "为后续缓存写入计算隐藏状态" },
+  { key: "verify_target_distribution_time_s", label: "目标概率分布", color: "rgba(245,158,11,0.85)", description: "目标概率分布计算（概率比）" },
+  { key: "verify_eval_unattributed_time_s", label: "未归类", color: "rgba(244,114,182,0.75)", description: "未归类的求值耗时，理想情况下接近零" },
+  { key: "accept_time_s", label: "接受采样", color: "rgba(0,214,143,0.55)", description: "接受采样与残差修正" },
+  { key: "repair_time_s", label: "修复", color: "rgba(239,68,68,0.85)", description: "拒绝后的修复计算（为 0 时可能延迟执行）" },
+  { key: "snapshot_time_s", label: "快照", color: "rgba(200,210,220,0.45)", description: "缓存快照与恢复" },
+  { key: "capture_commit_time_s", label: "捕获与提交", color: "rgba(0,214,143,0.35)", description: "捕获并提交验证状态的开销" },
+  { key: "rollback_time_s", label: "回滚", color: "rgba(240,88,106,0.55)", description: "拒绝后的状态回滚" },
 ];
 
 export function VerifyWaterfall() {
@@ -42,13 +42,13 @@ export function VerifyWaterfall() {
 
   return (
     <Card
-      title="Verify-cycle waterfall"
+      title="验证周期耗时分解"
       subtitle={
         latest
-          ? `verify total ${fmtSeconds(total)} · target forward ${fmtSeconds(
+          ? `验证总计 ${fmtSeconds(total)} · 目标模型前向 ${fmtSeconds(
               latest?.target_forward_time_s,
-            )} · draft ${fmtSeconds(latest?.draft_time_s)}`
-          : "no completed verify cycle"
+            )} · 草稿 ${fmtSeconds(latest?.draft_time_s)}`
+          : "尚无完成的验证周期"
       }
     >
       <div className="h-[280px]">
@@ -97,7 +97,7 @@ export function VerifyWaterfall() {
           </ResponsiveContainer>
         ) : (
           <div className="h-full grid place-items-center text-[var(--text-muted)] text-sm">
-            Run a generation to capture the verify decomposition.
+            完成一次生成后，将显示验证耗时分解。
           </div>
         )}
       </div>

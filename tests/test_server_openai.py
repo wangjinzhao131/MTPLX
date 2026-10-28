@@ -11178,6 +11178,13 @@ def test_tool_result_history_encoding_keeps_generation_prompt_prefix():
         initial_messages,
         enable_thinking=True,
         tools=tools,
+        add_generation_prompt=False,
+    )
+    # Echoed history omits transient date guidance; the assistant's opening
+    # think newline must still keep its original generation token boundary.
+    assert "Today's date" not in tokenizer.decode(first_prompt)
+    first_prompt += tokenizer.encode(
+        "<|im_start|>assistant\n<think>\n", add_special_tokens=False,
     )
     resumed_prompt = openai._encode_messages(
         tokenizer,
@@ -11263,11 +11270,13 @@ def test_postcommit_plain_final_answer_preserves_prior_tool_history_boundaries()
         ),
     ]
 
+    observability = {}
     generation_prompt = openai._encode_messages(
         tokenizer,
         messages_for_generation,
         enable_thinking=True,
         tools=tools,
+        template_observability=observability,
     )
     postcommit_prefix = openai._postcommit_next_turn_prefix_ids(
         tokenizer,
@@ -11285,7 +11294,11 @@ def test_postcommit_plain_final_answer_preserves_prior_tool_history_boundaries()
     )
 
     assert postcommit_prefix is not None
-    assert postcommit_prefix[: len(generation_prompt)] == generation_prompt
+    # The transient date suffix is absent from echoed history; prior tool
+    # history still has exactly the same tokens through the shared marker.
+    stable = observability["stable_prefix_len"]
+    assert postcommit_prefix[:stable] == generation_prompt[:stable]
+    assert "Today's date" not in tokenizer.decode(postcommit_prefix)
     assert tokenizer.merged not in postcommit_prefix[: len(generation_prompt)]
 
     next_turn_prompt = openai._encode_messages(

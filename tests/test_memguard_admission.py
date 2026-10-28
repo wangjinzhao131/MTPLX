@@ -2015,3 +2015,49 @@ def test_the_early_move_to_ssd_needs_an_ssd_cache_that_reads_back(tmp_path, monk
         assert entry.token_ids in bank._entries
     finally:
         tier.close()
+
+
+@pytest.mark.parametrize("pressure", ["soft", "system_limit", "engine_limit"])
+@pytest.mark.parametrize("cache_kind", ["snapshot", "cache_ref", "live_ref_only"])
+def test_approval_preserves_idle_main_until_the_refusal_line(monkeypatch, pressure, cache_kind):
+    """A 318-token approval must not discard a 23K main solely for headroom."""
+    manager = _manager()
+    main = _put(manager.bank, range(23_000), session_id="main", row_bytes=47_728, live_cache=cache_kind != "snapshot")
+    if cache_kind == "live_ref_only":
+        main.live_ref_only = True
+        main.lease_pinned_nbytes = main.nbytes
+    held = manager.bank.total_nbytes
+    machine = _Machine(manager.bank, base_gib=47 if pressure == "engine_limit" else 27,
+                       cache_gib=0, host_gib=0)
+    _install(monkeypatch, machine)
+    # The real 35B 64-row estimate and system reading from the Hermes replay.
+    monkeypatch.setattr(srv, "_admission_scratch_bytes", lambda *a, **kw: (2_441_084_928, "geometry"))
+    available = 4_000_000_000 if pressure == "system_limit" else 6_545_178_624
+    monkeypatch.setattr(sm, "_reader", lambda: sm.SystemMemory(
+        available_bytes=available + held - manager.bank.total_nbytes,
+        total_bytes=64 * GIB, level_percent=31,
+        free_bytes=1_461_780_480 + held - manager.bank.total_nbytes,
+        file_backed_bytes=available - 1_461_780_480,
+        wired_bytes=38_359_597_056 - held + manager.bank.total_nbytes,
+        compressor_bytes=8_258_191_360, swap_used_bytes=12_906_528_768,
+        monotonic_s=0.0,
+    ))
+    state = _state(manager, runtime=RUNTIME, limit_gib=48, total_gib=64, plan=SimpleNamespace(
+        kv_bytes_per_token_effective=20_480, aux_bytes_per_token=11_168,
+        prefill_transient_bytes_per_token=0, runtime_transients_bytes=3 * GIB,
+    ))
+    receipt = srv._prefill_admission_shed(
+        state, prompt_ids=list(range(90_000, 90_318)), session_bank=manager.bank,
+        session_id="approval", prefill_chunk_tokens=64,
+    )
+    assert receipt is not None
+    if pressure == "soft":
+        assert receipt["system_shortfall_bytes"] > 0
+        assert receipt["system_shortfall_bytes_after"] == 0
+        assert "idle_release" not in receipt
+        assert manager.bank._entries.get(main.token_ids) is main
+        assert not receipt.get("refused")
+    else:
+        assert receipt.get("terminal_entries_evicted", 0) + receipt.get("idle_release", {}).get("entries", 0) == 1
+        assert main.token_ids not in manager.bank._entries
+        assert bool(receipt.get("refused")) == (pressure == "engine_limit")

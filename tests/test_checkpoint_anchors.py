@@ -272,6 +272,52 @@ def test_a_set_within_the_budget_passes_through_the_bank_whole():
     assert _positions(entry.gdn_boundaries) == _positions(sink)
 
 
+def test_generation_final_checkpoints_survive_eviction_and_ssd_restart(tmp_path):
+    from mtplx.cache_bank.cold_tier import SessionBankColdTier
+    from mtplx.generation import GenerationFinalState
+    from mtplx.server.openai import _generation_final_bank_values
+
+    rt = _runtime()
+    bank = SessionBank()
+    boundaries = [_boundary(p) for p in (512, 1496)]
+    _put(bank, 1500, boundaries)
+    final = GenerationFinalState(
+        final_trunk_cache=[_KV(1600), _Recurrent(1600)],
+        final_logits=mx.zeros((1, 4)), final_hidden=None,
+        final_committed_mtp_cache=None, generated_token_ids=tuple(range(1500, 1600)),
+        safe_to_commit=True, finish_reason="stop",
+    )
+    final.gdn_boundaries = boundaries
+    assert bank.clear() == 1  # Pressure removed the prefix donor during decode.
+    values = _generation_final_bank_values(
+        SimpleNamespace(runtime=rt), final,
+        prompt_ids=list(range(1500)), final_token_ids=list(range(1600)),
+    )
+    entry = bank.put(runtime=rt, mtp_history_policy="cycle", **values)
+    assert _positions(entry.gdn_boundaries) == [512, 1496]
+    tier = SessionBankColdTier(base_dir=tmp_path / "bank", mode="on", min_prefix_tokens=1)
+    try:
+        assert tier.put_entry(entry, capabilities=["ar_insert"])
+        assert tier.flush(timeout_s=5)
+    finally:
+        tier.close()
+    bank.clear()
+    tier = SessionBankColdTier(base_dir=tmp_path / "bank", mode="on", min_prefix_tokens=1)
+    try:
+        hit = tier.lookup_prefix_boundary(
+            tuple(range(1498)) + (9999,) * 64,
+            model_path=str(rt.model_path), mtp_enabled=False, mtp_history_policy="cycle",
+            max_token_gap=8, block_size=16, block_min_matched_tokens=16,
+        )
+        assert hit is not None
+        assert hit.record.cache_snapshot_prefix_len == 1496
+        checkpoint = hit.record.gdn_boundaries[-1]
+        assert checkpoint[0] == 1496
+        assert float(checkpoint[1].states[1][0][0, 0]) == 1496.0
+    finally:
+        tier.close()
+
+
 def test_no_restore_starts_past_the_matched_prefix():
     bank = SessionBank()
     entry = _put(

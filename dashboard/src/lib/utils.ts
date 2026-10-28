@@ -7,7 +7,7 @@ export function cn(...inputs: ClassValue[]): string {
 
 export function fmtBytes(bytes: number | null | undefined): string {
   if (bytes === null || bytes === undefined || Number.isNaN(bytes)) return "—";
-  const units = ["B", "KB", "MB", "GB", "TB"];
+  const units = ["B", "KiB", "MiB", "GiB", "TiB"];
   let value = Number(bytes);
   let idx = 0;
   while (value >= 1024 && idx < units.length - 1) {
@@ -56,11 +56,11 @@ export function truncateMiddle(text: string | null | undefined, max = 24): strin
 export function relativeTime(timestampS: number | null | undefined): string {
   if (!timestampS) return "—";
   const diff = Date.now() / 1000 - timestampS;
-  if (diff < 1) return "just now";
-  if (diff < 60) return `${Math.round(diff)}s ago`;
-  if (diff < 3600) return `${Math.round(diff / 60)}m ago`;
-  if (diff < 86400) return `${Math.round(diff / 3600)}h ago`;
-  return `${Math.round(diff / 86400)}d ago`;
+  if (diff < 1) return "刚刚";
+  if (diff < 60) return `${Math.round(diff)} 秒前`;
+  if (diff < 3600) return `${Math.round(diff / 60)} 分钟前`;
+  if (diff < 86400) return `${Math.round(diff / 3600)} 小时前`;
+  return `${Math.round(diff / 86400)} 天前`;
 }
 
 // `_metrics_envelope` emits `accepted_by_depth` and `drafted_by_depth` but not

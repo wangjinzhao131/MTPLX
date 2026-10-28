@@ -77,37 +77,35 @@ export function PrefillPanel() {
 
   return (
     <Card
-      title="Prefill"
+      title="预填充（处理输入）"
       subtitle={
         lastCompleted
-          ? `last: ${fmtNumber(lastCompleted.new_prefill_tokens ?? lastCompleted.tokens_total)} tokens · ${fmtSeconds(
+          ? `上次：${fmtNumber(lastCompleted.new_prefill_tokens ?? lastCompleted.tokens_total)} tokens · ${fmtSeconds(
               lastCompleted.elapsed_s,
             )} · ${fmtTokS(lastCompleted.prefill_tok_s)} tok/s`
           : historyMeanTokS != null
-            ? `idle · historical mean ${fmtTokS(historyMeanTokS)} tok/s`
-            : "idle · no prefill samples yet"
+            ? `空闲 · 历史均值 ${fmtTokS(historyMeanTokS)} tok/s`
+            : "空闲 · 暂无预填充样本"
       }
     >
       <div className="grid grid-cols-3 gap-3 text-xs">
         <IdleStat
-          label="last new tokens"
+          label="上次新增 token"
           value={fmtNumber(lastCompleted?.new_prefill_tokens ?? lastCompleted?.tokens_total)}
         />
         <IdleStat
-          label="last cached"
+          label="上次复用 token"
           value={fmtNumber(lastCompleted?.cached_tokens)}
           tone="cool"
         />
         <IdleStat
-          label="last prefill tok/s"
+          label="上次预填充速度（token/s）"
           value={fmtTokS(lastCompleted?.prefill_tok_s)}
           tone="accent"
         />
       </div>
       <p className="text-xs text-[var(--text-muted)] mt-3 leading-relaxed">
-        This panel goes live when the server starts chewing a prompt. During
-        chunked prefill it shows progress %, live prefill tok/s, ETA, and
-        elapsed time — what you watch while the decode gauge is still zero.
+        服务开始处理输入时，此处显示预填充进度、实时速度、预计剩余时间和已用时间。此阶段尚未开始生成输出，生成速度为零是正常现象。
       </p>
     </Card>
   );
@@ -136,7 +134,7 @@ function ActiveCard({
       title={
         <span className="flex items-center gap-2">
           <Loader2 className="size-4 text-[var(--accent-warm)] animate-spin" />
-          <span>Prefill in progress</span>
+          <span>正在预填充</span>
         </span>
       }
       subtitle={
@@ -167,25 +165,25 @@ function ActiveCard({
 
       <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 mt-4 text-xs">
         <Stat
-          label="live prefill tok/s"
+          label="实时预填充速度（token/s）"
           value={fmtTokS(liveTokS)}
           tone="accent"
         />
         <Stat
-          label="ETA"
-          value={etaS != null ? fmtSeconds(etaS) : "calculating"}
+          label="预计剩余时间"
+          value={etaS != null ? fmtSeconds(etaS) : "计算中"}
           tone="warm"
         />
-        <Stat label="elapsed" value={fmtSeconds(liveElapsed)} />
+        <Stat label="已用时间" value={fmtSeconds(liveElapsed)} />
         <Stat
-          label="cached / total"
+          label="缓存 / 总量"
           value={`${fmtNumber(view.cached_tokens)} / ${fmtNumber(view.tokens_total)}`}
           tone="cool"
         />
       </div>
 
       <div className="text-[10px] uppercase tracking-widest text-[var(--text-muted)] mt-3">
-        request {truncateMiddle(view.request_id, 22)}
+        请求 {truncateMiddle(view.request_id, 22)}
       </div>
     </Card>
   );

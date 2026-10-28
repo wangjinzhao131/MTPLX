@@ -43,6 +43,8 @@ def _ready(gdn, inputs, mask, cache, capture_backend, module):
 def _compile_capture(gdn, original):
     def forward(inputs, conv_state, recurrent_state):
         gdn._capture_traces += 1
+        if hasattr(gdn, "_capture_forward"):
+            return gdn._capture_forward(inputs, conv_state, recurrent_state)
         scratch = ArraysCache(2)
         scratch[0], scratch[1] = conv_state, recurrent_state
         backend = "linear_gdn" if inputs.shape[1] in (2, 3) else "stock"

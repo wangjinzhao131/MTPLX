@@ -34,31 +34,31 @@ export function HardwareBanner() {
   const chipBadge = chipBadgeFor(machine?.chip, machine?.machine_model);
 
   return (
-    <Card title="Hardware" subtitle={machine?.machine_model ?? "unknown machine model"}>
+    <Card title="硬件" subtitle={machine?.machine_model ?? "未知机型"}>
       <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3">
         <Tile
           icon={<Cpu className="size-4 text-[var(--accent)]" />}
-          label="chip"
+          label="芯片"
           value={chipBadge}
         />
         <Tile
           icon={<MemoryStick className="size-4 text-[var(--accent-cool)]" />}
-          label="unified memory"
+          label="统一内存"
           value={fmtBytes(machine?.unified_memory_bytes ?? null)}
         />
         <Tile
           icon={<Sparkles className="size-4 text-[var(--accent-warm)]" />}
-          label="profile"
+          label="配置方案"
           value={profileName ?? "—"}
         />
         <Tile
           icon={<Cpu className="size-4 text-[var(--text-muted)]" />}
-          label="context window"
+          label="上下文窗口"
           value={contextWindow ? `${contextWindow.toLocaleString()} tok` : "—"}
         />
       </div>
       <div className="mt-3 text-xs text-[var(--text-muted)] truncate">
-        loaded model: <span className="text-[var(--text-primary)]">{modelId ?? "—"}</span>
+        已加载模型： <span className="text-[var(--text-primary)]">{modelId ?? "—"}</span>
       </div>
     </Card>
   );

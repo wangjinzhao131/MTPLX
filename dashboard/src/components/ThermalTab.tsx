@@ -12,32 +12,28 @@ export function ThermalTab() {
         <FanRingPanel />
       </div>
       <div className="col-span-12 lg:col-span-5">
-        <Card title="Thermal snapshot" subtitle={whenS ? relativeTime(whenS) : "no poll yet"}>
+        <Card title="温度与风扇快照" subtitle={whenS ? relativeTime(whenS) : "尚无采样"}>
           {thermal ? (
             <dl className="text-sm space-y-1">
-              <Field label="ok" value={String(thermal.ok)} />
-              <Field label="min RPM" value={String(thermal.min_rpm ?? "—")} />
-              <Field label="max RPM" value={String(thermal.max_rpm ?? "—")} />
-              <Field label="fans" value={String(thermal.fans?.length ?? 0)} />
+              <Field label="状态" value={thermal.ok ? "正常" : "不可用"} />
+              <Field label="最低转速（RPM）" value={String(thermal.min_rpm ?? "—")} />
+              <Field label="最高转速（RPM）" value={String(thermal.max_rpm ?? "—")} />
+              <Field label="风扇数量" value={String(thermal.fans?.length ?? 0)} />
             </dl>
           ) : (
             <p className="text-sm text-[var(--text-muted)]">
-              Thermal polling is off by default. Pass{" "}
-              <code>--enable-thermal-poll</code> when starting MTPLX.
+              温度与风扇采样默认关闭。启动 MTPLX 时添加 <code>--enable-thermal-poll</code> 可开启。
             </p>
           )}
         </Card>
       </div>
       <div className="col-span-12">
         <Card
-          title="GPU MHz · coming in v2"
-          subtitle="ThermalForge does not expose GPU clock; powermetrics integration lands later"
+          title="GPU 频率 · 尚未接入"
+          subtitle="ThermalForge 不提供 GPU 频率，后续需接入 powermetrics"
         >
           <p className="text-sm text-[var(--text-muted)] leading-relaxed">
-            ThermalForge's <code>status</code> JSON shape (verified May 2026) covers fan
-            RPMs and modes but not GPU MHz or thermal pressure. The dashboard plan
-            documents GPU MHz as a v2 add via <code>powermetrics</code>; until then
-            this slot is intentionally empty so we don't render a fake number.
+            ThermalForge 的 <code>status</code> 接口提供风扇转速和模式，但不提供 GPU 频率或温度压力。接入 <code>powermetrics</code> 前，此处不显示估算值。
           </p>
         </Card>
       </div>

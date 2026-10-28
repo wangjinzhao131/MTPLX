@@ -7,20 +7,6 @@ from typing import Any
 import mlx.core as mx
 
 
-def _repeat_kv_for_gqa(
-    keys: mx.array,
-    values: mx.array,
-    query_heads: int,
-) -> tuple[mx.array, mx.array]:
-    kv_heads = int(keys.shape[1])
-    if kv_heads == int(query_heads):
-        return keys, values
-    if int(query_heads) % kv_heads:
-        raise ValueError(f"query_heads={query_heads} must be divisible by kv_heads={kv_heads}")
-    repeat = int(query_heads) // kv_heads
-    return mx.repeat(keys, repeat, axis=1), mx.repeat(values, repeat, axis=1)
-
-
 def _apply_causal_block_mask(
     scores: mx.array,
     *,
@@ -55,16 +41,21 @@ def blockwise_attention(
     if not blocks:
         raise ValueError("blockwise attention requires at least one active KV block")
     query_heads = int(queries.shape[1])
-    q = queries.astype(mx.float32)
+    kv_heads = int(blocks[0][1].shape[1])
+    if query_heads % kv_heads:
+        raise ValueError(f"query_heads={query_heads} must be divisible by kv_heads={kv_heads}")
+    # Broadcast each physical KV head across its query group without repeating it.
+    q = queries.astype(mx.float32).reshape(
+        queries.shape[0], kv_heads, query_heads // kv_heads, *queries.shape[2:]
+    )
     running_max = None
     running_denom = None
     running_acc = None
 
     for block_start, keys, values in blocks:
-        keys, values = _repeat_kv_for_gqa(keys, values, query_heads)
-        k = keys.astype(mx.float32)
-        v = values.astype(mx.float32)
-        scores = mx.matmul(q, k.transpose(0, 1, 3, 2)) * float(scale)
+        k = keys.astype(mx.float32)[:, :, None]
+        v = values.astype(mx.float32)[:, :, None]
+        scores = mx.matmul(q, k.transpose(0, 1, 2, 4, 3)) * float(scale)
         scores = _apply_causal_block_mask(
             scores,
             block_start=int(block_start),
@@ -90,4 +81,6 @@ def blockwise_attention(
 
     if running_acc is None or running_denom is None:
         raise ValueError("blockwise attention did not accumulate any blocks")
-    return (running_acc / running_denom).astype(queries.dtype)
+    return (running_acc / running_denom).reshape(
+        queries.shape[0], query_heads, queries.shape[2], -1
+    ).astype(queries.dtype)

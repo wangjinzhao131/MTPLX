@@ -136,15 +136,15 @@ export function TPSGauge() {
 
   return (
     <Card
-      title="Live decode TPS"
+      title="实时生成速度"
       subtitle={
         prefill.active
-          ? `prefilling ${prefill.pct.toFixed(0)}% — decode not started`
+          ? `预填充 ${prefill.pct.toFixed(0)}% · 尚未开始生成`
           : isLive
-            ? `current ${fmtTokS(liveTokS)} tok/s`
+            ? `当前 ${fmtTokS(liveTokS)} tok/s`
             : heldTokS !== null
-              ? `idle · last request ${fmtTokS(heldTokS)} tok/s`
-              : "waiting for generation"
+              ? `空闲 · 上次请求 ${fmtTokS(heldTokS)} tok/s`
+              : "等待生成"
       }
     >
       <div className="relative grid place-items-center min-h-[220px]">
@@ -155,10 +155,10 @@ export function TPSGauge() {
               <>
                 <span className="inline-flex items-center gap-2 text-[20px] font-semibold tracking-wide text-[var(--accent-warm)] leading-none">
                   <Loader2 className="size-5 animate-spin" />
-                  PREFILLING
+                  正在预填充
                 </span>
                 <span className="text-xs text-[var(--text-muted)] mt-2 block tabular-nums">
-                  {prefill.pct.toFixed(1)}% · decode hasn't started yet
+                  {prefill.pct.toFixed(1)}% · 尚未开始生成
                 </span>
               </>
             ) : (
@@ -171,7 +171,7 @@ export function TPSGauge() {
                   {displayValue}
                 </motion.span>
                 <span className="text-xs text-[var(--text-muted)] mt-1 block">
-                  {isLive ? "live" : heldTokS !== null ? "last request" : "idle"}
+                  {isLive ? "实时" : heldTokS !== null ? "最近请求" : "空闲"}
                 </span>
               </>
             )}
@@ -179,9 +179,9 @@ export function TPSGauge() {
         </div>
       </div>
       <div className="grid grid-cols-3 gap-2 mt-3 text-xs">
-        <Stat label="window min" value={fmtTokS(min)} />
-        <Stat label="window max" value={fmtTokS(max)} tone="warm" />
-        <Stat label="all-time" value={fmtTokS(peak)} tone="accent" />
+        <Stat label="窗口最低" value={fmtTokS(min)} />
+        <Stat label="窗口最高" value={fmtTokS(max)} tone="warm" />
+        <Stat label="历史最高" value={fmtTokS(peak)} tone="accent" />
       </div>
     </Card>
   );

@@ -36,15 +36,15 @@ export function OverviewTab() {
       </div>
 
       <div className="col-span-6 lg:col-span-4">
-        <Card title="In flight">
+        <Card title="正在处理">
           <BigNumber
             value={fmtNumber(inFlight.length)}
-            unit="requests"
+            unit="个请求"
             tone={inFlight.length > 0 ? "accent" : "default"}
             caption={
               inFlight.length === 0
-                ? "idle · waiting for next request"
-                : `${inFlight.length} active · oldest ${fmtSeconds(
+                ? "空闲 · 等待下一个请求"
+                : `${inFlight.length} 个处理中 · 最久 ${fmtSeconds(
                     Math.max(...inFlight.map((h) => h.age_s)),
                   )}`
             }
@@ -54,16 +54,16 @@ export function OverviewTab() {
 
       <div className="col-span-6 lg:col-span-4">
         <Card
-          title="Cache + context"
+          title="缓存与上下文"
           subtitle={
             sessionBank
-              ? `${sessionBank.prefixes?.length ?? 0} of ${sessionBank.max_entries} slots`
+              ? `${sessionBank.prefixes?.length ?? 0} / ${sessionBank.max_entries} 个缓存位`
               : "—"
           }
         >
           <BigNumber
             value={`${contextPct.toFixed(0)}%`}
-            unit="context used"
+            unit="上下文已用"
             tone={contextPct >= 75 ? "warm" : contextPct >= 95 ? "hot" : "cool"}
             caption={`${fmtNumber(contextLen)} / ${fmtNumber(contextWindow)} tokens`}
           />
@@ -71,18 +71,18 @@ export function OverviewTab() {
       </div>
 
       <div className="col-span-12 lg:col-span-6">
-        <Card title="Last request" subtitle="from /metrics latest">
+        <Card title="最近请求" subtitle="来自最新请求指标">
           <div className="grid grid-cols-2 gap-3 text-sm">
-            <Field label="decode tok/s" value={fmtTokS(latest?.decode_tok_s)} highlight />
-            <Field label="ttft" value={fmtSeconds(latest?.ttft_s)} />
-            <Field label="prompt eval" value={fmtSeconds(latest?.prompt_eval_time_s)} />
-            <Field label="decode" value={fmtSeconds(latest?.decode_elapsed_s)} />
+            <Field label="生成速度（token/s）" value={fmtTokS(latest?.decode_tok_s)} highlight />
+            <Field label="首 token 延迟" value={fmtSeconds(latest?.ttft_s)} />
+            <Field label="预填充耗时" value={fmtSeconds(latest?.prompt_eval_time_s)} />
+            <Field label="生成耗时" value={fmtSeconds(latest?.decode_elapsed_s)} />
             <Field
-              label="prefill tok/s"
+              label="预填充速度（token/s）"
               value={fmtTokS(latest?.prefill_tok_s)}
             />
             <Field
-              label="cached"
+              label="已缓存"
               value={`${fmtNumber(latest?.cached_tokens)} / ${fmtNumber(latest?.prompt_tokens)}`}
             />
           </div>
@@ -90,27 +90,27 @@ export function OverviewTab() {
       </div>
 
       <div className="col-span-12 lg:col-span-6">
-        <Card title="Session" subtitle="from latest envelope">
+        <Card title="会话" subtitle="来自最新指标快照">
           <div className="grid grid-cols-2 gap-3 text-sm">
             <Field
-              label="session id"
+              label="会话 ID"
               value={latest?.session_id ? latest.session_id : "—"}
             />
             <Field
-              label="cache hit"
-              value={latest?.session_cache_hit ? "yes" : "no"}
+              label="缓存命中"
+              value={latest?.session_cache_hit ? "是" : "否"}
               highlight={Boolean(latest?.session_cache_hit)}
             />
             <Field
-              label="restore mode"
+              label="恢复方式"
               value={latest?.session_restore_mode ?? "—"}
             />
             <Field
-              label="miss reason"
+              label="未命中原因"
               value={latest?.cache_miss_reason ?? "—"}
             />
-            <Field label="mtp depth" value={fmtNumber(latest?.mtp_depth)} />
-            <Field label="verify calls" value={fmtNumber(latest?.verify_calls)} />
+            <Field label="MTP 深度" value={fmtNumber(latest?.mtp_depth)} />
+            <Field label="验证次数" value={fmtNumber(latest?.verify_calls)} />
           </div>
         </Card>
       </div>

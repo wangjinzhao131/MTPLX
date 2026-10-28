@@ -23,19 +23,18 @@ export function RequestLogTable() {
 
   return (
     <Card
-      title="Recent requests"
+      title="最近请求"
       subtitle={
         rows.length === 0
-          ? "no requests yet"
-          : `${rows.length} of ${polledRecent.data?.recent?.length ?? storeRecent.length}${
-              sessionFilter ? ` · filtered by ${sessionFilter}` : ""
+          ? "暂无请求"
+          : `${rows.length} / ${polledRecent.data?.recent?.length ?? storeRecent.length}${
+              sessionFilter ? ` · 筛选会话 ${sessionFilter}` : ""
             }`
       }
     >
       {rows.length === 0 ? (
         <div className="text-sm text-[var(--text-muted)]">
-          Drive a few requests against this server and they will appear here in
-          order, most recent first.
+          请求完成后会显示在这里，最近的排在最前。
         </div>
       ) : (
         <div className="overflow-x-auto -mx-3">
@@ -43,15 +42,15 @@ export function RequestLogTable() {
             <thead className="text-[10px] uppercase tracking-widest text-[var(--text-muted)]">
               <tr>
                 <Th />
-                <Th>session</Th>
-                <Th align="right">prompt</Th>
-                <Th align="right">cached</Th>
-                <Th align="right">gen</Th>
+                <Th>会话</Th>
+                <Th align="right">输入</Th>
+                <Th align="right">已缓存</Th>
+                <Th align="right">输出</Th>
                 <Th align="right">tok/s</Th>
-                <Th align="right">ttft</Th>
-                <Th align="right">verify</Th>
-                <Th>cache</Th>
-                <Th align="right">when</Th>
+                <Th align="right">首 token 延迟</Th>
+                <Th align="right">验证次数</Th>
+                <Th>缓存</Th>
+                <Th align="right">时间</Th>
               </tr>
             </thead>
             <tbody>
@@ -133,9 +132,9 @@ function Row({
 }) {
   const sessionId = row.session_id ?? "—";
   const cacheBadge = row.session_cache_hit
-    ? { label: "HIT", color: "text-[var(--accent)] bg-[var(--accent)]/10" }
+    ? { label: "命中", color: "text-[var(--accent)] bg-[var(--accent)]/10" }
     : {
-        label: (row.cache_miss_reason ?? "MISS").toUpperCase(),
+        label: (row.cache_miss_reason ?? "未命中").toUpperCase(),
         color: "text-[var(--accent-warm)] bg-[var(--accent-warm)]/10",
       };
   return (
@@ -146,7 +145,7 @@ function Row({
             type="button"
             onClick={onToggle}
             className="text-[var(--text-muted)] hover:text-[var(--text-primary)]"
-            aria-label={isOpen ? "Collapse" : "Expand"}
+            aria-label={isOpen ? "收起" : "展开"}
           >
             {isOpen ? <ChevronDown className="size-4" /> : <ChevronRight className="size-4" />}
           </button>

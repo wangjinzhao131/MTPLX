@@ -107,6 +107,8 @@ def _text(value: Any, *, field_name: str) -> str:
     for index, part in enumerate(value):
         if not isinstance(part, Mapping):
             raise unsupported(f"{field_name}[{index}] must be a text part")
+        if "prompt_cache_breakpoint" in part:
+            raise unsupported("prompt_cache_breakpoint is supported only by /v1/chat/completions")
         part_type = str(part.get("type") or "").strip().lower()
         if part_type not in {"input_text", "output_text", "text"}:
             raise unsupported(

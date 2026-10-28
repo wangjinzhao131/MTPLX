@@ -69,7 +69,7 @@ from fastapi.responses import (
     Response,
     StreamingResponse,
 )
-from pydantic import AliasChoices, BaseModel, ConfigDict, Field
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field, PrivateAttr
 
 from mtplx import progress_heartbeat
 from mtplx.a3b_mtp_batch import (
@@ -1771,6 +1771,10 @@ def _configure_mlx_cache_limit(args: argparse.Namespace) -> dict[str, Any]:
 class ChatMessage(BaseModel):
     model_config = ConfigDict(extra="allow")
 
+    # Only server-appended contracts may absorb render-only date guidance.
+    _mtplx_transient_suffix: bool = PrivateAttr(default=False)
+    _mtplx_cache_breakpoint: tuple[str, int] | None = PrivateAttr(default=None)
+
     role: str
     content: Any = ""
     name: str | None = None
@@ -1800,6 +1804,7 @@ class ChatCompletionRequest(BaseModel):
     generation_mode: str | None = None
     seed: int | None = None
     enable_thinking: bool | None = None
+    thinking_token_budget: int | None = Field(default=None, strict=True, gt=0)
     reasoning_effort: str | None = None
     stream: bool = False
     tools: list[dict[str, Any]] | None = None
@@ -1809,6 +1814,7 @@ class ChatCompletionRequest(BaseModel):
     stream_options: dict[str, Any] | None = None
     response_format: Any = None
     metadata: dict[str, Any] | None = None
+    prompt_cache_key: str | None = None
     user: str | None = None
     # Declared so logprobs are never silently swallowed by extra="allow".
     # Served for the first generated token only (max_tokens 1, non-stream);
@@ -6319,6 +6325,8 @@ def _anthropic_content_to_chat_content(content: Any) -> Any:
     """
 
     blocks = _anthropic_content_blocks(content)
+    if any(isinstance(block, dict) and "prompt_cache_breakpoint" in block for block in blocks):
+        raise HTTPException(status_code=400, detail="prompt_cache_breakpoint is supported only by /v1/chat/completions")
     parts: list[dict[str, Any]] = []
     text_run: list[str] = []
     saw_image = False
@@ -8446,18 +8454,8 @@ _DATE_LINE_PIN: dict[str, Any] = {"day": None, "last_use_monotonic": None}
 
 
 def _pinned_render_day() -> str:
-    # Burst-pinned wall-clock day (audit F11 P2 date-pin). The date line
-    # below is part of the rendered system prompt, so the old "fresh
-    # strftime every call" flipped msg0's bytes at local midnight and every
-    # LIVE session re-prefilled its whole transcript cold mid-conversation.
-    # The day now advances only across an idle boundary: while requests
-    # keep arriving (foreground encodes AND their postcommit re-renders,
-    # which share this module-level pin across threads) the pinned day
-    # holds, and after _DATE_LINE_IDLE_REFRESH_S without any date-line use
-    # the next request re-pins to today. Staleness is bounded by continuous
-    # activity — which is exactly the window where changing the date would
-    # have forced the re-prefill this pin exists to prevent. Fresh daemons
-    # always start on today's date.
+    # Keep date guidance consistent within an active request burst. It now
+    # lives in transient suffixes, so an idle refresh preserves cached history.
     now = time.monotonic()
     with _DATE_LINE_PIN_LOCK:
         day = _DATE_LINE_PIN["day"]
@@ -8473,7 +8471,7 @@ def _pinned_render_day() -> str:
 
 def _current_date_line() -> str:
     # Local wall-clock date, day granularity, burst-pinned (see
-    # _pinned_render_day). Injected into the tool and post-tool contracts
+    # _pinned_render_day). Injected into tool and post-tool suffixes
     # so the model stops anchoring "latest version" reasoning (and search
     # queries) to its training cutoff — without it, queries came out as
     # "latest X 2024 2025" and final answers dismissed fresher tool results
@@ -8526,7 +8524,7 @@ def _mtplx_tool_contract_text(
     # other per-request steering text (see _with_mtplx_tool_contract); the
     # parameter stays for the callers, the text no longer depends on it.
     return (
-        f"{_MTPLX_TOOL_CONTRACT_SENTINEL} {_current_date_line()} Your "
+        f"{_MTPLX_TOOL_CONTRACT_SENTINEL} Your "
         "training data ends before today; treat tool results as more "
         "current than your own knowledge. "
         f"Declared tools and schemas: {allowed}. "
@@ -9056,6 +9054,8 @@ def _with_mtplx_tool_contract(
     tools: list[dict[str, Any]] | None,
     tool_choice: Any = None,
     observability: dict[str, Any] | None = None,
+    include_current_date: bool = False,
+    trailing_contract_injected: bool = False,
 ) -> list[dict[str, Any]]:
     if not tools:
         return normalized
@@ -9065,8 +9065,6 @@ def _with_mtplx_tool_contract(
         if _should_add_mtplx_coding_agent_tail_contract(normalized, tools=tools)
         else None
     )
-    if not normalized:
-        return [{"role": "system", "content": contract}]
     messages = [dict(item) for item in normalized]
     if _append_tool_result_continuation_hint(messages, tools=tools):
         if observability is not None:
@@ -9074,7 +9072,16 @@ def _with_mtplx_tool_contract(
     if _append_forced_tool_choice_sentinel(messages, tool_choice=tool_choice):
         if observability is not None:
             observability["forced_tool_choice_sentinel_injected"] = True
-    first = messages[0]
+    if include_current_date:
+        date_contract = _mtplx_current_date_contract_text()
+        # Keep final instructions last, and never rewrite a client lookalike.
+        if len(messages) > len(normalized) or trailing_contract_injected:
+            messages[-1]["content"] = date_contract + "\n\n" + messages[-1]["content"]
+        else:
+            messages.append({"role": "user", "content": date_contract})
+        if observability is not None:
+            observability["current_date_sentinel_injected"] = True
+    first = messages[0] if messages else {}
     if first.get("role") == "system":
         content = str(first.get("content") or "")
         additions: list[str] = []
@@ -15366,12 +15373,24 @@ def _encode_rendered_chat_turns(
     with _chat_encode_snapshot(tokenizer) as snapshot:
         if not _chat_turn_segments_proven(tokenizer, snapshot.fingerprint)[0]:
             return _encode_rendered_chat_text(tokenizer, rendered)
-        return _encode_rendered_chat_text_segmented(
-            tokenizer,
-            rendered,
-            _chat_turn_boundaries(rendered),
+        boundaries = _chat_turn_boundaries(rendered)
+        boundary = (
+            _trailing_tool_hint_char_boundary(rendered)
+            if _tool_postcommit_experiment_enabled() and template_observability is not None
+            and (template_observability.get("tool_result_continuation_hint_injected") is True
+                 or template_observability.get("current_date_sentinel_injected") is True)
+            else None
+        )
+        counts = {boundary: -1} if boundary is not None else None
+        if boundary is not None:
+            boundaries.append(boundary)
+        token_ids = _encode_rendered_chat_text_segmented(
+            tokenizer, rendered, boundaries, token_counts_at=counts,
             template_observability=template_observability,
         )
+        if counts is not None and 0 < counts[boundary] < len(token_ids):
+            template_observability["stable_prefix_len"] = counts[boundary]
+        return token_ids
 
 
 def _chat_turn_boundaries(rendered: str) -> list[int]:
@@ -15742,6 +15761,10 @@ def _encode_with_stable_hint_boundary(
     return token_ids
 
 
+def _mtplx_current_date_contract_text() -> str:
+    return f"MTPLX current date guidance for this request only: {_current_date_line()}"
+
+
 def _transient_trailing_user_sentinel_texts() -> tuple[str, ...]:
     """Registry of transient user-turn suffixes MTPLX itself appends.
 
@@ -15758,6 +15781,7 @@ def _transient_trailing_user_sentinel_texts() -> tuple[str, ...]:
         _mtplx_forced_tool_choice_text(),
         _mtplx_no_tool_contract_text(),
         _mtplx_post_tool_answer_contract_text(),
+        _mtplx_current_date_contract_text(),
     )
 
 
@@ -15935,6 +15959,102 @@ def _chat_tokenizer_encoding_fingerprint(tokenizer: Any) -> str:
 _ADDED_TOKEN_MATCH_FLAGS = ("single_word", "lstrip", "rstrip", "normalized", "special")
 
 
+
+def _prepare_explicit_cache_breakpoint(messages: list[ChatMessage]) -> list[ChatMessage]:
+    """Keep the declared text edge private while ordinary prompt rendering stays unchanged."""
+    marked = []
+    for index, message in enumerate(messages):
+        if "prompt_cache_breakpoint" in (getattr(message, "model_extra", None) or {}):
+            raise HTTPException(status_code=400, detail="prompt_cache_breakpoint belongs on a text content part")
+        content = message.content
+        if isinstance(content, dict) and "prompt_cache_breakpoint" in content:
+            raise HTTPException(status_code=400, detail="prompt_cache_breakpoint requires a text content part array")
+        if not isinstance(content, list):
+            continue
+        for part_index, part in enumerate(content):
+            if isinstance(part, dict) and "prompt_cache_breakpoint" in part:
+                if (
+                    part.get("type") != "text"
+                    or not isinstance(part.get("text"), str)
+                    or part["prompt_cache_breakpoint"] != {"mode": "explicit"}
+                ):
+                    raise HTTPException(status_code=400, detail="prompt_cache_breakpoint must be {mode: explicit} on a text part")
+                marked.append((index, part_index))
+    if not marked:
+        return messages
+    if len(marked) != 1 or any(message._mtplx_cache_breakpoint is not None for message in messages):
+        raise HTTPException(status_code=400, detail="only one prompt_cache_breakpoint is supported per request")
+    for message in messages:
+        if isinstance(message.content, list) and any(
+            not isinstance(part, dict) or part.get("type") != "text" or not isinstance(part.get("text"), str)
+            for part in message.content
+        ):
+            raise HTTPException(status_code=400, detail="prompt_cache_breakpoint supports text-only requests")
+    index, part_index = marked[0]
+    source = messages[index]
+    parts = [dict(part) for part in source.content]
+    parts[part_index].pop("prompt_cache_breakpoint")
+    text = "".join(part["text"] for part in parts)
+    boundary = sum(len(part["text"]) for part in parts[:part_index + 1])
+    updated = source.model_copy(update={"content": parts})
+    updated._mtplx_cache_breakpoint = (text, boundary)
+    result = list(messages)
+    result[index] = updated
+    return result
+
+
+def _explicit_boundary_from_text(tokenizer: Any, token_ids: Sequence[int], prefix: str) -> int:
+    """Find an exact served edge without treating incomplete UTF-8 as extra characters."""
+    text = tokenizer.decode(list(token_ids))
+    if not text.startswith(prefix):
+        raise HTTPException(status_code=400, detail="prompt_cache_breakpoint changed during canonicalization")
+    decoded = {0: "", len(token_ids): text}
+
+    def at(index: int) -> str:
+        if index not in decoded:
+            decoded[index] = tokenizer.decode(list(token_ids[:index]))
+        return decoded[index]
+
+    low, high = 0, len(token_ids)
+    while high - low > 1:
+        middle = (low + high) // 2
+        if not text.startswith(at(middle)):
+            # Byte-fallback tokens and cleanup can revise the unfinished tail.
+            # Bracket it with exact prefixes instead of comparing replacement-character lengths.
+            left = right = middle
+            while left > low and not text.startswith(at(left)):
+                left -= 1
+            while right < high and not text.startswith(at(right)):
+                right += 1
+            if len(prefix) <= len(at(left)):
+                high = left
+            elif len(prefix) >= len(at(right)):
+                low = right
+            else:
+                break
+        elif len(at(middle)) < len(prefix):
+            low = middle
+        else:
+            high = middle
+    for index in (low, high):
+        if 0 < index < len(token_ids) and at(index) == prefix:
+            return index
+    raise HTTPException(status_code=400, detail="prompt_cache_breakpoint is not an exact served token boundary")
+
+
+def _refresh_explicit_cache_boundary(
+    tokenizer: Any, token_ids: Sequence[int], observability: dict[str, Any],
+) -> None:
+    chars = observability.get("explicit_cache_boundary_chars")
+    if chars is None:
+        return
+    text = tokenizer.decode(list(token_ids))
+    prefix = text[:int(chars)]
+    if hashlib.sha256(prefix.encode("utf-8")).hexdigest() != observability.get("explicit_cache_boundary_sha256"):
+        raise HTTPException(status_code=400, detail="prompt_cache_breakpoint changed during canonicalization")
+    observability["explicit_cache_boundary"] = _explicit_boundary_from_text(tokenizer, token_ids, prefix)
+
+
 def _encode_messages(
     tokenizer: Any,
     messages: list[ChatMessage],
@@ -15963,6 +16083,7 @@ def _encode_messages(
     again before the whole-request entry and the new segment ids are
     stored, which happens only if it did not change.
     """
+    messages = _prepare_explicit_cache_breakpoint(messages)
     with _chat_encode_snapshot(tokenizer) as snapshot:
         if not GLOBAL_CHAT_ENCODE_CACHE.enabled():
             return _encode_messages_uncached(
@@ -15996,6 +16117,7 @@ def _encode_messages(
                         )
                         for m in messages
                     ],
+                    "explicit_cache_breakpoints": [m._mtplx_cache_breakpoint for m in messages],
                     "enable_thinking": bool(enable_thinking),
                     "reasoning_effort": reasoning_effort,
                     "strip": bool(strip_assistant_reasoning_history),
@@ -16006,15 +16128,17 @@ def _encode_messages(
                     "tool_choice": tool_choice,
                     "tool_prompt_mode": tool_prompt_mode,
                     "committed_reasoning": bool(allow_committed_reasoning),
-                    # The rendered prompt embeds the current date (tool contract's
-                    # burst-pinned _current_date_line; hypothetically also
+                    "transient_suffix": bool(
+                        messages and messages[-1]._mtplx_transient_suffix
+                    ),
+                    # The rendered prompt embeds the current date (transient
+                    # burst-pinned date suffix; hypothetically also
                     # strftime_now-style templates reading the raw wall clock).
                     # Key on BOTH days so the key flips whenever either source
                     # can change the render: raw wall clock covers
                     # template-embedded dates at midnight, the pinned day covers
-                    # the contract line at pin refresh. A flip only re-renders
-                    # once — the pinned contract bytes stay identical across
-                    # midnight, so session/bank prefixes are unaffected.
+                    # the suffix at pin refresh. A flip re-renders the request
+                    # while retaining the date-free session/bank history.
                     "render_day": (
                         f"{time.strftime('%Y-%m-%d')}:{_pinned_render_day()}"
                     ),
@@ -16073,6 +16197,64 @@ def _encode_messages_uncached(
     template_observability: dict[str, Any] | None = None,
     allow_committed_reasoning: bool = False,
 ) -> list[int]:
+    kwargs = dict(
+        enable_thinking=enable_thinking, reasoning_effort=reasoning_effort,
+        strip_assistant_reasoning_history=strip_assistant_reasoning_history,
+        scoped_reasoning_history=scoped_reasoning_history,
+        preserve_reasoning_history=preserve_reasoning_history,
+        add_generation_prompt=add_generation_prompt, tools=tools,
+        tool_choice=tool_choice, tool_prompt_mode=tool_prompt_mode,
+        allow_committed_reasoning=allow_committed_reasoning,
+    )
+    ids = _encode_messages_unmarked(
+        tokenizer, messages, template_observability=template_observability, **kwargs,
+    )
+    markers = [(index, message._mtplx_cache_breakpoint) for index, message in enumerate(messages)
+               if message._mtplx_cache_breakpoint is not None]
+    if not markers:
+        return ids
+    if len(markers) != 1:
+        raise HTTPException(status_code=400, detail="only one prompt_cache_breakpoint is supported per request")
+    index, (source, offset) = markers[0]
+    if _content_to_text(messages[index].content) != source:
+        raise HTTPException(status_code=400, detail="prompt_cache_breakpoint content changed during normalization")
+    sentinel = "MTPLXCACHEBOUNDARY" + uuid.uuid4().hex
+    diagnostic = list(messages)
+    diagnostic[index] = messages[index].model_copy(update={"content": source[:offset] + sentinel + source[offset:]})
+    diagnostic[index]._mtplx_cache_breakpoint = None
+    marked_ids = _encode_messages_unmarked(
+        tokenizer, diagnostic, template_observability={}, **kwargs,
+    )
+    marked_text, text = tokenizer.decode(marked_ids), tokenizer.decode(ids)
+    if marked_text.count(sentinel) != 1:
+        raise HTTPException(status_code=400, detail="prompt_cache_breakpoint was removed or duplicated by the chat template")
+    before, after = marked_text.split(sentinel)
+    if before + after != text:
+        raise HTTPException(status_code=400, detail="prompt_cache_breakpoint cannot be mapped through this chat template")
+    boundary = _explicit_boundary_from_text(tokenizer, ids, before)
+    if template_observability is not None:
+        template_observability["explicit_cache_boundary"] = boundary
+        template_observability["explicit_cache_boundary_chars"] = len(before)
+        template_observability["explicit_cache_boundary_sha256"] = hashlib.sha256(before.encode("utf-8")).hexdigest()
+    return ids
+
+
+def _encode_messages_unmarked(
+    tokenizer: Any,
+    messages: list[ChatMessage],
+    *,
+    enable_thinking: bool,
+    reasoning_effort: str | None = None,
+    strip_assistant_reasoning_history: bool = False,
+    scoped_reasoning_history: bool = False,
+    preserve_reasoning_history: bool = False,
+    add_generation_prompt: bool = True,
+    tools: list[dict[str, Any]] | None = None,
+    tool_choice: Any = None,
+    tool_prompt_mode: str = _TOOL_PROMPT_MODE_HYBRID,
+    template_observability: dict[str, Any] | None = None,
+    allow_committed_reasoning: bool = False,
+) -> list[int]:
     # Scoped mode keeps reasoning_content on the normalized messages and
     # passes preserve_thinking=False so the template's own rolling checkpoint
     # governs: think blocks survive inside the active agent round (after the
@@ -16110,17 +16292,31 @@ def _encode_messages_uncached(
         )
         if item is not None:
             prepared_messages.append(item)
+    effective_tool_prompt_mode = _normalize_tool_prompt_mode(tool_prompt_mode)
+    # Keep a server suffix separate when normalization joins adjacent user turns.
+    trailing_contract = (
+        prepared_messages.pop()
+        if (
+            add_generation_prompt
+            and _tool_contract_active_for_mode(
+                tools_active=bool(tools), tool_prompt_mode=effective_tool_prompt_mode,
+            )
+            and messages and messages[-1]._mtplx_transient_suffix
+        )
+        else None
+    )
     normalized = omlx_normalize_messages_for_template(
         prepared_messages,
         tokenizer=tokenizer,
         native_reasoning_content=not strip_assistant_reasoning_history,
-    )
+    ) if prepared_messages else []
+    if trailing_contract is not None:
+        normalized.append(trailing_contract)
     if strip_assistant_reasoning_history:
         for item in normalized:
             item.pop("reasoning_content", None)
     if not normalized:
         normalized = [{"role": "user", "content": ""}]
-    effective_tool_prompt_mode = _normalize_tool_prompt_mode(tool_prompt_mode)
     if _tool_contract_active_for_mode(
         tools_active=bool(tools),
         tool_prompt_mode=effective_tool_prompt_mode,
@@ -16130,6 +16326,8 @@ def _encode_messages_uncached(
             tools=tools,
             tool_choice=tool_choice,
             observability=template_observability,
+            include_current_date=add_generation_prompt,
+            trailing_contract_injected=trailing_contract is not None,
         )
     elif effective_tool_prompt_mode == _TOOL_PROMPT_MODE_NATIVE and tools:
         normalized, native_tail_added = _with_mtplx_native_agent_tail(
@@ -16261,10 +16459,13 @@ def _encode_messages_uncached(
             )
     if (
         template_observability is not None
-        and template_observability.get("tool_result_continuation_hint_injected") is True
+        and (
+            template_observability.get("tool_result_continuation_hint_injected") is True
+            or template_observability.get("current_date_sentinel_injected") is True
+        )
     ):
         # Hybrid tool mode encodes through this plain single-call path, so
-        # the stable-prefix report for the injected trailing hint lives
+        # the stable-prefix report for the injected trailing hint/date lives
         # here: render once with identical kwargs, split the encode at the
         # hint turn's <|im_start|> (a special token — merge-safe), record
         # the cumulative count. Ids are identical; any irregularity falls
@@ -16837,7 +17038,14 @@ def _request_extra(model: BaseModel, key: str, default: Any = None) -> Any:
 
 def _request_metadata(model: BaseModel) -> dict[str, Any]:
     metadata = _request_extra(model, "metadata", {})
-    return metadata if isinstance(metadata, dict) else {}
+    metadata = metadata if isinstance(metadata, dict) else {}
+    prompt_cache_key = _request_extra(model, "prompt_cache_key")
+    if prompt_cache_key is not None:
+        if not prompt_cache_key.strip():
+            raise HTTPException(status_code=400, detail="prompt_cache_key must not be empty")
+        metadata = dict(metadata)
+        metadata.setdefault("session_id", prompt_cache_key)
+    return metadata
 
 
 _CLIENT_REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,95}$")
@@ -20400,11 +20608,13 @@ class _PrefillSystemGuard:
         under-priced the request stops here instead of past the limit.
 
     Before any of them stops the request, the engine gives back its own
-    reusable memory once (``_shed_reusable_memory``: the allocator pool, the
+    reusable memory (``_shed_reusable_memory``: the allocator pool, the
     RAM state of every conversation that is not generating, conversations
     already on SSD first, then this conversation's own entries the request
     cannot restore from) and reads the Mac again; only a line still crossed
-    after that stops the request with a 507 before the chunk (the E2d agent
+    after that stops the request with a 507 before the chunk. Later pressure
+    checks reclaim a rebuilt allocator pool without sweeping sessions again
+    (the E2d agent
     replay, 2026-09-29: a request was refused while idle session snapshots
     and the pool were still held). An unreadable machine skips the Mac's
     lines, ``--allow-swap`` skips all of them, and the trip belongs to this
@@ -20467,8 +20677,7 @@ class _PrefillSystemGuard:
         self._episode_growth_max: int | None = None
         self.last_read_s: float | None = None
         self.tripped: dict[str, Any] | None = None
-        # What the engine gave back before deciding to stop this request
-        # (at most once per request), and whether the request then went on.
+        # The latest reclamation receipt; whole-session release runs once.
         self.shed: dict[str, Any] | None = None
         self.checks = 0
         caps = getattr(state, "metal_memory_caps", None)
@@ -20525,7 +20734,9 @@ class _PrefillSystemGuard:
         self.last_read_s = now_s
         self.checks += 1
         verdict = self._evaluate()
-        if verdict["reason"] is not None and self.shed is None:
+        if verdict["reason"] is not None and (
+            self.shed is None or verdict["pool"] > 0
+        ):
             # The engine's own reusable memory goes back before a request is
             # refused, and the Mac is read again.
             self.shed = self._shed_reusable_memory(verdict)
@@ -20771,6 +20982,10 @@ class _PrefillSystemGuard:
             _mx.clear_cache()
         except Exception as exc:
             receipt["pool_error"] = repr(exc)
+        if self.shed is not None:
+            # Long prefills refill the pool; do not repeat session eviction.
+            receipt["pool_only"] = True
+            return receipt
         # A line with a size (the engine limit, the Mac's abort floor)
         # releases whole conversations until that shortfall is covered;
         # compression the Mac is losing to has no size, so every idle
@@ -21756,7 +21971,8 @@ def _admission_context_transient_per_token(
 
 
 def _admission_restore_copies_prefix(
-    entry: Any, restore_mode: str, session_id: str | None = None
+    entry: Any, restore_mode: str, session_id: str | None = None,
+    *, native_ownership_proven: bool = False, required_boundary: int | None = None,
 ) -> bool:
     """Whether restoring from ``entry`` puts a second copy of its prefix in memory.
 
@@ -21785,8 +22001,14 @@ def _admission_restore_copies_prefix(
         # Nothing to lease: the restore clones the snapshot, or misses.
         return True
     if getattr(entry, "live_ref_only", False):
-        from mtplx.session_bank import _lease_owned_by
+        from mtplx.session_bank import _lease_owned_by, _native_lease_cache
 
+        if _tool_postcommit_experiment_enabled() and isinstance(entry.cache_ref, (list, tuple)) and _native_lease_cache(entry.cache_ref):
+            return not native_ownership_proven or bool(
+                required_boundary is not None and entry.has_recurrent
+                and 0 < required_boundary < entry.prefix_len
+                and not entry.has_recurrent_boundary(required_boundary)
+            )
         return not _lease_owned_by(entry, session_id)
     if not getattr(entry, "lazy_kv", False):
         return False
@@ -21949,6 +22171,21 @@ def _lease_cache_shape(entry: Any) -> dict[str, Any] | None:
         rows_fn = getattr(layer, "kv_quant_working_rows", None)
         working.append(int(rows_fn()) if callable(rows_fn) else 0)
     if not capacities:
+        from mtplx.session_bank import _native_lease_cache
+
+        if _tool_postcommit_experiment_enabled() and _native_lease_cache(cache):
+            layers = list(cache) + list(getattr(entry, "mtp_history_cache_ref", None) or ())
+            kv = [layer for layer in layers if getattr(layer, "keys", None) is not None]
+            if kv:
+                return {
+                    "paged": False,
+                    "native_capacity_tokens": min(int(layer.keys.shape[-2]) for layer in kv),
+                    "native_step": max(int(layer.step) for layer in kv),
+                    "native_bytes_per_token": sum(
+                        (int(layer.keys.nbytes) + int(layer.values.nbytes)) // int(layer.keys.shape[-2])
+                        for layer in kv
+                    ),
+                }
         return {"paged": False}
     return {
         "paged": True,
@@ -22214,6 +22451,20 @@ def _admission_growth(
         else:
             held_fixed = int(geometry.prefill_fixed_bytes) if M else 0
         live_prefill = restore_rows * row_width + held_fixed + M * live_w
+        if lease is not None and lease.get("native_capacity_tokens") is not None:
+            capacity = int(lease["native_capacity_tokens"])
+            step = max(1, int(lease["native_step"]))
+            native_w = int(lease["native_bytes_per_token"])
+            lease_capacity_after = capacity
+            chunk = max(1, int(prefill_chunk_tokens or M or 1))
+            for start in range(R, P, chunk):
+                count = min(chunk, P - start)
+                if start + count > lease_capacity_after:
+                    # KVCache concatenates the current allocation with rounded new rows.
+                    old_capacity = lease_capacity_after
+                    lease_capacity_after = (start if start % step else old_capacity) + ((count + step - 1) // step) * step
+                    lease_transient = max(lease_transient, old_capacity * native_w)
+            live_prefill = held_fixed + max(0, lease_capacity_after - capacity) * native_w + M * max(0, live_w - native_w)
     else:
         row_width = paged_w
         restore_fixed = 0
@@ -22700,6 +22951,7 @@ def _prefill_admission_shed(
     pricing: dict[str, Any] | None = None,
     prompt_scoring: bool = False,
     wide_prefill_rungs: Sequence[int] = (),
+    required_boundary: int | None = None,
 ) -> dict[str, Any] | None:
     """Price a request before its prefill; give back idle memory, or refuse.
 
@@ -22788,6 +23040,7 @@ def _prefill_admission_shed(
             pricing=pricing,
             prompt_scoring=prompt_scoring,
             wide_prefill_rungs=wide_prefill_rungs,
+            required_boundary=required_boundary,
         )
         _note_guard_health(state, where="prefill_admission", error=None)
         return receipt
@@ -22857,6 +23110,8 @@ def _admission_narrow_widths(runtime: Any, widths: Sequence[int | None]) -> list
         or _runtime_has_qsa_indexer(runtime)
     ):
         return []
+    if getattr(runtime, "local_optimization", None) in {"qwen35-ar", "qwen35-mtp"}:
+        return [w for w in (256, 64) if w < int(widths[-1])]
     rungs = _ADMISSION_NARROW_PREFILL_WIDTHS
     if _dense_prefill_bill(_runtime_text_args(runtime), 1) is None:
         rungs = tuple(w for w in rungs if w >= _DENSE_PREFILL_FLAT_WIDTH)
@@ -22879,6 +23134,7 @@ def _run_prefill_admission(
     pricing: dict[str, Any] | None = None,
     prompt_scoring: bool = False,
     wide_prefill_rungs: Sequence[int] = (),
+    required_boundary: int | None = None,
 ) -> dict[str, Any] | None:
     from mtplx.generation import (
         _store_on_prefill_env_enabled,
@@ -22990,7 +23246,7 @@ def _run_prefill_admission(
         else 0
     )
 
-    def publishes(miss: int) -> bool:
+    def publishes(miss: int, *, native_lease: bool = False) -> bool:
         if own_snapshot:
             # The backend clones the prompt cache before decode whenever it
             # will bank the turn; neither store-on-prefill nor the
@@ -23003,7 +23259,7 @@ def _run_prefill_admission(
         committed = bool(commit_prompt_prefix and session_id) and miss > 0
         if not (stored or committed):
             return False
-        if one_copy:
+        if one_copy or native_lease:
             # A lease holds no snapshot, so the per-session cap never
             # refuses it.
             return True
@@ -23054,6 +23310,18 @@ def _run_prefill_admission(
         # What the restore copies of the source entry's windows: the entry's
         # own, which a wider chunk than this request's left larger.
         source_windows = getattr(source, "window_nbytes", None) if copies else None
+        native_publication = bool(
+            serialized_native and not copies and lease
+            and "native_capacity_tokens" in lease
+        )
+        publish_bytes = anchor_bytes
+        if native_publication:
+            measured_anchor = one_copy_anchor_nbytes(runtime)
+            auxiliary = getattr(source, "lease_aux_nbytes", None)
+            if measured_anchor is not None and isinstance(auxiliary, int) and auxiliary > 0:
+                # Retain the anchor and rebind current recurrent state; native
+                # trunk and MTP history remain owned live references.
+                publish_bytes = measured_anchor + max(measured_anchor, auxiliary)
         model = _admission_growth(
             at_width,
             prompt_tokens=prompt_tokens,
@@ -23062,7 +23330,7 @@ def _run_prefill_admission(
             layout=layout,
             source_layout=source_layout,
             output_tokens=output_tokens,
-            publish=publishes(miss),
+            publish=publishes(miss, native_lease=native_publication),
             scratch_bytes=scratch,
             lease=lease,
             context_transient_bytes_per_token=transient_per_token,
@@ -23071,7 +23339,7 @@ def _run_prefill_admission(
             restore_fixed_bytes=(
                 int(source_windows) if source_windows is not None and int(reused) > 0 else None
             ),
-            publish_bytes=anchor_bytes,
+            publish_bytes=publish_bytes,
             slack_rows=slack_rows,
         )
         model["scratch_source"] = scratch_source
@@ -23118,8 +23386,17 @@ def _run_prefill_admission(
     # banked, at the request's own width. It bounds every split of this
     # prompt, so when it clears both lines the request is admitted without
     # probing the bank.
+    scheduler = getattr(state, "model_scheduler", None)
+    native_extend = getattr(session_bank, "native_lease_can_extend", None)
+    # This critical section remains on the model owner through the real restore;
+    # no borrower or spill can create an alias between this bill and takeover.
+    serialized_native = bool(
+        _tool_postcommit_enabled(state) and session_id and callable(native_extend)
+        and scheduler is not None and scheduler.is_owner_thread()
+        and state.lock.locked()
+    )
     cheap = growth(0, True, None, widths[0])
-    if shed_deficit(now, cheap) <= 0:
+    if shed_deficit(now, cheap) <= 0 and not serialized_native:
         settle(cheap)
         return None
 
@@ -23200,6 +23477,11 @@ def _run_prefill_admission(
                 # still owns its live cache.
                 restore_mode if reused_mode == "exact" else "reference",
                 session_id,
+                native_ownership_proven=bool(
+                    serialized_native and source_entry is not None
+                    and native_extend(source_entry, session_id=session_id, token_ids=probe_ids)
+                ),
+                required_boundary=required_boundary,
             )
             if reused_mode in {"exact", "near_prefix"}
             else True
@@ -23631,7 +23913,10 @@ def _run_prefill_admission(
                 # runs inside the engine's generation lock, so no other
                 # request restores while it walks.
                 if _prefill_admission_chain_shed_enabled():
-                    remaining = deficit(now)
+                    remaining = refusal_deficit(now, current)
+                    allow_terminal = remaining > 0
+                    if not allow_terminal:
+                        remaining = deficit(now)
                     bank_bytes_now = int(session_bank.total_nbytes)
                     chain_fn = getattr(session_bank, "shrink_for_admission", None)
                     if remaining > 0 and bank_bytes_now > 0 and callable(chain_fn):
@@ -23642,6 +23927,7 @@ def _run_prefill_admission(
                                 reason="prefill_admission_chain",
                                 protect_keys=set(restore["keys"]) | kept_keys,
                                 protect_session_ids=in_flight_ids,
+                                allow_terminal=allow_terminal,
                             )
                         except QueuedPersistenceCancelError as exc:
                             chain_evicted, terminal_evicted = exc.receipt or (0, 0)
@@ -23657,22 +23943,22 @@ def _run_prefill_admission(
                 receipt["bank_error"] = repr(exc)
                 step_errors.append(exc)
 
-    # 6. Whole idle conversations (the 2026-09-26 report: pi's compaction is
-    # a new session and the conversation it summarizes is idle, holding a
-    # generation-final and a postcommit entry with a live cache each).
+    # 6. Whole idle conversations only before refusal: a short approval
+    # must not discard the waiting main conversation just to reach the
+    # higher shed floor. Pools and redundant snapshots were reclaimed above.
     keep_ids = set(in_flight_ids)
     if session_id:
         keep_ids.add(str(session_id))
     sessions = getattr(state, "sessions", None)
     release_fn = getattr(sessions, "release_idle_sessions", None)
-    if chosen is _ADMISSION_NO_FIT and callable(release_fn) and deficit(now) > 0:
+    if chosen is _ADMISSION_NO_FIT and callable(release_fn) and refusal_deficit(now, current) > 0:
         rounds: list[dict[str, Any]] = []
         try:
             # First round sized to the deficit (the bank's own byte count);
             # the second, only if the measurement still does not fit,
             # takes every idle session: shared buffers make a bank byte
             # count an upper bound on what an eviction frees.
-            for target in (deficit(now), None):
+            for target in (refusal_deficit(now, current), None):
                 if target is not None and target <= 0:
                     continue
                 rounds.append(
@@ -23687,7 +23973,7 @@ def _run_prefill_admission(
                 clear_pool()
                 now = measure()
                 replan("idle_sessions", rounds[-1].get("entries"))
-                if deficit(now) <= 0 or not rounds[-1].get("entries"):
+                if refusal_deficit(now, current) <= 0 or not rounds[-1].get("entries"):
                     break
             steps.append("idle_sessions")
         except Exception as exc:
@@ -24492,6 +24778,10 @@ def _shutdown_flush_cold_writes(state: "ServerState") -> dict[str, Any]:
     queue's task accounting. Bounded and honest — one console line says
     how many writes flushed and how many remained.
     """
+    with _TOOL_POSTCOMMIT_LOCK:
+        deferred = [(session_id, record["token"]) for session_id, record in getattr(state, "_tool_postcommits", {}).items()]
+    for session_id, token in deferred:
+        _release_tool_postcommit(state, session_id, token=token)
     outcome = {"pending_before": 0, "flushed": 0, "remained": 0, "elapsed_s": 0.0}
     budget_s = _shutdown_flush_timeout_s()
     scheduler = getattr(state, "model_scheduler", None)
@@ -24939,6 +25229,34 @@ def _session_keep_live_refs_for_request(
     )
 
 
+def _short_stateless_cache_request(
+    *, messages: list[Any], prompt_tokens: int, tools_active: bool,
+    session_source: str | None,
+) -> bool:
+    # Hermes approvals are one-shot even when the reviewed command is long.
+    system_text = (
+        _content_to_text(messages[0].content)
+        if messages and str(messages[0].role) == "system" else ""
+    )
+    approval = (
+        system_text.startswith(
+            "You are a security reviewer for an AI coding agent. "
+            "You assess whether shell commands are safe to execute."
+        )
+        and "Respond with exactly one word: APPROVE, DENY, or ESCALATE" in system_text
+    )
+    return bool(
+        (prompt_tokens < 512 or approval)
+        and not tools_active
+        and session_source in {
+            "new", "longest_prefix", "common_prefix_reuse", "pending_postcommit_near_prefix"
+        }
+        and [str(message.role) for message in messages] in (
+            ["user"], ["system", "user"], ["developer", "user"]
+        )
+    )
+
+
 def _commit_prompt_prefix_for_request(
     state: Any,
     *,
@@ -25334,6 +25652,9 @@ def _generation_truth_stats(
 
 
 PUBLIC_MTPLX_STATS_KEYS = (
+    "thinking_guard",
+    "tool_postcommit_work",
+    "prefill_admission_growth",
     "local_optimization",
     "mode",
     "profile",
@@ -25557,6 +25878,7 @@ PUBLIC_MTPLX_STATS_KEYS = (
     "client_sampler_fields_ignored",
     "request_enable_thinking",
     "request_enable_thinking_override",
+    "request_thinking_token_budget",
     "request_reasoning_mode",
     "request_reasoning_parser",
     "request_temperature",
@@ -25782,6 +26104,8 @@ PUBLIC_MTPLX_STATS_KEYS = (
     "response_tail_wait",
 )
 PUBLIC_POSTCOMMIT_KEYS = (
+    "ram",
+    "idle_s",
     "stored",
     "mode",
     "reason",
@@ -26145,6 +26469,7 @@ def _request_observability(
         "request_client_hint": client_hint,
         "request_client_label": client_hint or "openai",
         "request_tool_count": len(request.tools or []),
+        "request_thinking_token_budget": request.thinking_token_budget,
         "request_tool_names": [
             name for tool in (request.tools or []) if (name := _tool_spec_name(tool))
         ],
@@ -26360,9 +26685,15 @@ def _policy_fingerprint(
     adaptive = _adaptive_config(state.args, max_depth=effective_depth)
     proposal_cache = _proposal_cache_config(state.args)
     online_hidden = _online_hidden_config(state.args)
+    # Qwen's thinking switch changes prompt tokens, not forward semantics.
+    # Keep the established thinking=1 identity; token/checkpoint matching still
+    # validates reuse when a tool turn switches thinking off.
+    thinking_identity = bool(thinking_enabled) or getattr(
+        getattr(state, "runtime", None), "local_optimization", None
+    ) in {"qwen35-ar", "qwen35-mtp"}
     parts = [
         f"template={state.template_hash}",
-        f"thinking={int(bool(thinking_enabled))}",
+        f"thinking={int(thinking_identity)}",
         _reasoning_history_fingerprint_component(state),
         f"openai_bridge={_OPENAI_BRIDGE_POLICY_VERSION}",
         f"tool_prompt_mode={effective_tool_prompt_mode}",
@@ -27161,6 +27492,7 @@ def _store_retokenized_history_snapshot(
                 gdn_boundaries=list(
                     getattr(prompt_state, "gdn_boundaries", None) or []
                 ),
+                explicit_cache_boundary=getattr(prompt_state, "explicit_cache_boundary", None),
                 mtp_history_snapshot=mtp_snapshot,
                 mtp_history_cache_ref=(
                     prompt_state.committed_mtp_cache if mtp_by_ref else None
@@ -27534,6 +27866,7 @@ def _generation_final_postcommit_compatibility(
     strip_tool_call_preamble_text: bool = False,
     session: Any | None = None,
     timing: dict[str, Any] | None = None,
+    defer_tool_history: bool = False,
 ) -> dict[str, Any]:
     # Tool-call turns are no longer refused a priori (the retired
     # "tool_call_history_rewrite" gate): the byte-compare below is the real
@@ -27582,6 +27915,17 @@ def _generation_final_postcommit_compatibility(
     final_token_ids = [int(token) for token in prompt_ids] + final_generated_tokens
     if not final_token_ids:
         return {"safe": False, "mode": "unsafe", "reason": "empty_generation_boundary"}
+    if defer_tool_history and assistant_tool_calls and all(
+        message.content is None or isinstance(message.content, str)
+        or (isinstance(message.content, list) and all(
+            isinstance(part, dict) and part.get("type") == "text"
+            for part in message.content
+        ))
+        for message in messages
+    ):
+        # This is the exact served stream key, not a claim about canonical history.
+        return {"safe": True, "mode": "generation_final_ram", "reason": "served_tokens_exact",
+                "token_ids": final_token_ids, "history_suffix_tokens": 0}
     history_started = time.perf_counter()
     history_ids, history_vision_splice = _history_ids_for_postcommit(
         state,
@@ -27781,6 +28125,7 @@ def _generation_final_bank_metadata(
     final_state: Any,
     *,
     token_count: int,
+    keep_live_ref: bool = False,
 ) -> dict[str, Any]:
     """Bank identity and MTP-history payload for a generation-final put.
 
@@ -27794,7 +28139,7 @@ def _generation_final_bank_metadata(
     """
     backend_id = _bank_backend_id(state)
     committed_mtp_cache = getattr(final_state, "final_committed_mtp_cache", None)
-    if committed_mtp_cache is not None and one_copy_runtime(state.runtime):
+    if committed_mtp_cache is not None and (one_copy_runtime(state.runtime) or (keep_live_ref and _tool_postcommit_enabled(state))):
         # One-copy store: the draft head's history rides the lease by
         # reference, like the trunk; a snapshot here would be copied into the
         # entry (session_bank live_ref_entry).
@@ -27871,6 +28216,8 @@ def _generation_final_bank_values(
         "logits": final_state.final_logits,
         "hidden": final_state.final_hidden,
         "extra_state": getattr(final_state, "extra_state", None),
+        "gdn_boundaries": list(getattr(final_state, "gdn_boundaries", None) or []),
+        "explicit_cache_boundary": getattr(final_state, "explicit_cache_boundary", None),
     }
 
 
@@ -27924,6 +28271,7 @@ def _store_generation_final_history_snapshot(
         strip_tool_call_preamble_text=strip_tool_call_preamble_text,
         session=session,
         timing=timing,
+        defer_tool_history=_tool_postcommit_enabled(state),
     )
     _record_phase(timing, "compat_s", started)
     final_state = generated.get("_final_state")
@@ -27975,6 +28323,7 @@ def _store_generation_final_history_snapshot(
             state,
             final_state,
             token_count=len(token_ids),
+            keep_live_ref=keep_live_ref,
         )
         phase_started = _record_phase(timing, "mtp_snapshot_s", phase_started)
         bank = state.sessions.bank
@@ -27996,6 +28345,15 @@ def _store_generation_final_history_snapshot(
         put_timing: dict[str, Any] = {}
         if _callable_accepts_keyword(bank.put, "timing_out"):
             put_kwargs["timing_out"] = put_timing
+        if compatibility.get("mode") == "generation_final_ram" and keep_live_ref:
+            put_kwargs["prefer_live_ref"] = True
+            put_kwargs["native_stable_prefix_len"] = generated.get("stats", {}).get("stable_prefix_len")
+            put_kwargs["native_owned"] = (
+                generated.get("stats", {}).get("cache_source") == "none"
+                and generated.get("stats", {}).get("session_cache_hit") is False
+            )
+            put_kwargs["mtp_history_snapshot"] = None
+            put_kwargs["mtp_history_cache_ref"] = getattr(final_state, "final_committed_mtp_cache", None)
         entry = bank.put(**put_kwargs)
         _record_phase(timing, "put_s", phase_started)
         if put_timing:
@@ -28219,6 +28577,177 @@ def _merge_response_tail_into_metrics(
             return
 
 
+_TOOL_POSTCOMMIT_IDLE_S = 15.0
+_TOOL_POSTCOMMIT_LOCK = Lock()
+
+
+def _tool_postcommit_experiment_enabled() -> bool:
+    return os.environ.get("MTPLX_TOOL_POSTCOMMIT_DEBOUNCE", "0").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _tool_postcommit_enabled(state: Any) -> bool:
+    bank = getattr(getattr(state, "sessions", None), "bank", None)
+    return bool(
+        _tool_postcommit_experiment_enabled()
+        and getattr(getattr(state, "runtime", None), "local_optimization", None) == "qwen35-mtp"
+        and callable(getattr(bank, "hold_session_persistence", None))
+        and callable(getattr(bank, "release_session_persistence", None))
+    )
+
+
+def _tool_postcommit_owner_call(state: Any, fn: Callable[[], Any], *, wait: bool = True) -> Any:
+    scheduler = getattr(state, "model_scheduler", None)
+    if scheduler is not None and scheduler.is_owner_thread():
+        return fn()
+    future = _submit_foreground_model_work(state, fn, batch_key="postcommit_hold")
+    return future.result() if wait else future
+
+
+def _pause_tool_postcommit(state: Any, session_id: str | None, request_id: str) -> bool:
+    """Suspend an existing idle intent before request canonicalization/waits."""
+    with _TOOL_POSTCOMMIT_LOCK:
+        record = getattr(state, "_tool_postcommits", {}).get(session_id)
+        if record is None or (record.get("active") and record["request_id"] != request_id):
+            return False
+        if record.get("active"):
+            return True
+        timer = record.pop("timer", None)
+        if timer is not None:
+            timer.cancel()
+        record.update(active=True, request_id=request_id, token=uuid.uuid4().hex)
+        return True
+
+
+def _hold_tool_postcommit(state: Any, session_id: str | None, request_id: str) -> None:
+    if not session_id or not _tool_postcommit_enabled(state):
+        return
+    with _TOOL_POSTCOMMIT_LOCK:
+        records = getattr(state, "_tool_postcommits", None)
+        if records is None:
+            records = state._tool_postcommits = {}
+        record = records.setdefault(session_id, {"intent": None})
+        timer = record.pop("timer", None)
+        if timer is not None:
+            timer.cancel()
+        record.update(active=True, request_id=request_id, token=uuid.uuid4().hex)
+    _tool_postcommit_owner_call(
+        state, lambda: state.sessions.bank.hold_session_persistence(session_id)
+    )
+
+
+def _release_tool_postcommit(
+    state: Any, session_id: str | None, *, token: str | None = None,
+    request_id: str | None = None, wait: bool = True,
+) -> None:
+    if not session_id:
+        return
+    with _TOOL_POSTCOMMIT_LOCK:
+        record = getattr(state, "_tool_postcommits", {}).get(session_id)
+        if record is None or (token is not None and record["token"] != token):
+            return
+        if request_id is not None and record["request_id"] != request_id:
+            return
+
+    def release() -> None:
+        with _TOOL_POSTCOMMIT_LOCK:
+            records = getattr(state, "_tool_postcommits", {})
+            record = records.get(session_id)
+            if record is None or (token is not None and record["token"] != token):
+                return
+            if request_id is not None and record["request_id"] != request_id:
+                return
+            records.pop(session_id)
+            timer = record.pop("timer", None)
+            if timer is not None:
+                timer.cancel()
+            state.sessions.bank.release_session_persistence(session_id)
+
+    _tool_postcommit_owner_call(state, release, wait=wait)
+
+
+def _arm_tool_postcommit(state: Any, session_id: str, record: dict[str, Any]) -> None:
+    # Only CPU history and identity live in the record; no final-state/cache captures.
+    timer = Timer(
+        _TOOL_POSTCOMMIT_IDLE_S, _launch_tool_postcommit,
+        args=(state, session_id, record["token"]),
+    )
+    timer.daemon = True
+    record["timer"] = timer
+    timer.start()
+
+
+def _defer_tool_postcommit(
+    state: Any, *, session_id: str, request_id: str | None,
+    payload: dict[str, Any],
+) -> dict[str, Any] | None:
+    with _TOOL_POSTCOMMIT_LOCK:
+        record = getattr(state, "_tool_postcommits", {}).get(session_id)
+        if record is None:
+            return None
+        if request_id is not None and record["request_id"] != request_id:
+            return {"stored": False, "mode": "abandoned_stale", "reason": "newer_request"}
+        timer = record.pop("timer", None)
+        if timer is not None:
+            timer.cancel()
+        record.update(active=False, intent=payload, token=uuid.uuid4().hex)
+        _arm_tool_postcommit(state, session_id, record)
+    return {"stored": False, "mode": "idle_deferred", "reason": "tool_call_idle_delay", "idle_s": _TOOL_POSTCOMMIT_IDLE_S}
+
+
+def _tool_postcommit_failed(state: Any, session_id: str | None, request_id: str) -> None:
+    if not session_id:
+        return
+    with _TOOL_POSTCOMMIT_LOCK:
+        record = getattr(state, "_tool_postcommits", {}).get(session_id)
+        if record is None or record["request_id"] != request_id or not record["active"]:
+            return
+        record["active"] = False
+        if record["intent"] is not None:
+            # A failed successor must not lose the preceding tool turn's intent.
+            _arm_tool_postcommit(state, session_id, record)
+            return
+        token = record["token"]
+    _release_tool_postcommit(state, session_id, token=token)
+
+
+def _launch_tool_postcommit(state: Any, session_id: str, token: str) -> None:
+    with _TOOL_POSTCOMMIT_LOCK:
+        record = getattr(state, "_tool_postcommits", {}).get(session_id)
+        if record is None or record["token"] != token or record["active"]:
+            return
+        record.pop("timer", None)
+        payload = dict(record["intent"] or {})
+    session = state.sessions.peek(session_id)
+    if not payload or session is None or getattr(session, "revision", None) != payload.get("expected_session_revision"):
+        _release_tool_postcommit(state, session_id, token=token)
+        return
+    try:
+        _schedule_idle_postcommit_snapshot(
+            state, session_id=session_id, session=session,
+            _defer_tools=False, _deferred_token=token, **payload,
+        )
+    except BaseException:
+        _release_tool_postcommit(state, session_id, token=token)
+        LOGGER.exception("Could not schedule deferred tool postcommit")
+
+
+def _tool_postcommit_work_snapshot(state: Any) -> dict[str, Any]:
+    scheduler = getattr(state, "model_scheduler", None)
+    counters = scheduler.stats() if callable(getattr(scheduler, "stats", None)) else {}
+    cold = getattr(state, "session_bank_cold_tier", None)
+    writes = cold.stats() if callable(getattr(cold, "stats", None)) else {}
+    return {
+        "monotonic_s": time.monotonic(),
+        "started_by_batch_key": counters.get("started_by_batch_key", {}),
+        "completed_by_kind": counters.get("completed_by_kind", {}),
+        "ssd_writes_enqueued": int(writes.get("writes_enqueued") or 0),
+        "ssd_pending_writes": max(0, int(writes.get("writes_enqueued") or 0)
+            - int(writes.get("writes_completed") or 0)
+            - int(writes.get("write_failures") or 0)
+            - int(writes.get("writes_cancelled") or 0)),
+    }
+
+
 def _idle_postcommit_foreground_grace_s() -> float:
     """Bounded window during which a running postcommit finishes despite a
     queued foreground request.
@@ -28262,6 +28791,9 @@ def _schedule_idle_postcommit_snapshot(
     strip_tool_call_preamble_text: bool = False,
     committed_stream_ids: Sequence[int] | None = None,
     retry_count: int = 0,
+    request_id: str | None = None,
+    _defer_tools: bool = True,
+    _deferred_token: str | None = None,
 ) -> dict[str, Any]:
     """Schedule a background SessionBank commit for a response the
     generation-final compatibility check rejected as unsafe (most commonly
@@ -28276,6 +28808,30 @@ def _schedule_idle_postcommit_snapshot(
     rechecks that no newer foreground is queued and that the session did not
     advance before it builds a new cache.
     """
+    if _deferred_token is not None:
+        with _TOOL_POSTCOMMIT_LOCK:
+            current = getattr(state, "_tool_postcommits", {}).get(session_id)
+            if current is None or current["token"] != _deferred_token:
+                return {"stored": False, "mode": "abandoned_stale", "reason": "newer_request"}
+    if assistant_tool_calls and _defer_tools and session_id and _tool_postcommit_enabled(state):
+        deferred = _defer_tool_postcommit(
+            state, session_id=session_id, request_id=request_id,
+            payload=dict(
+                messages=[message.model_copy(deep=True) for message in messages],
+                assistant_content=assistant_content,
+                assistant_tool_calls=json.loads(json.dumps(assistant_tool_calls)),
+                thinking_enabled=thinking_enabled, reasoning_effort=reasoning_effort,
+                policy_fingerprint=policy_fingerprint, unsafe_reason=unsafe_reason,
+                tool_specs=json.loads(json.dumps(tool_specs)),
+                expected_session_revision=expected_session_revision,
+                keep_live_ref=keep_live_ref, tool_prompt_mode=tool_prompt_mode,
+                strip_tool_call_preamble_text=strip_tool_call_preamble_text,
+                committed_stream_ids=list(committed_stream_ids or ()),
+                request_id=request_id,
+            ),
+        )
+        if deferred is not None:
+            return deferred
     if assistant_tool_calls and str(
         os.environ.get("MTPLX_IDLE_POSTCOMMIT_TOOL_REWRITE", "1")
     ).strip().lower() in {"0", "false", "off", "no"}:
@@ -28288,6 +28844,8 @@ def _schedule_idle_postcommit_snapshot(
         # This is the "postcommit ghost re-prefill" pathology. Kill switch until
         # the hybrid-lane canonical rendering is byte-proven against real
         # next-turn prompts; store-on-prefill + block salvage remain.
+        if _deferred_token is not None:
+            _release_tool_postcommit(state, session_id, token=_deferred_token)
         return {
             "stored": False,
             "mode": "disabled",
@@ -28304,6 +28862,8 @@ def _schedule_idle_postcommit_snapshot(
     pending_record_holder: dict[str, Any] = {}
 
     def _log(outcome: dict[str, Any]) -> None:
+        if _deferred_token is not None and not outcome.get("retry_scheduled"):
+            _release_tool_postcommit(state, session_id, token=_deferred_token, wait=False)
         record = pending_record_holder.get("record")
         try:
             _flight(state).pc(session_id, outcome)
@@ -28352,6 +28912,11 @@ def _schedule_idle_postcommit_snapshot(
             return None
 
     def _stale_session_revision() -> bool:
+        if _deferred_token is not None:
+            with _TOOL_POSTCOMMIT_LOCK:
+                current = getattr(state, "_tool_postcommits", {}).get(session_id)
+                if current is None or current["token"] != _deferred_token:
+                    return True
         observed = _observed_session_revision()
         return (
             expected_session_revision is not None
@@ -28438,6 +29003,9 @@ def _schedule_idle_postcommit_snapshot(
                 strip_tool_call_preamble_text=strip_tool_call_preamble_text,
                 committed_stream_ids=committed_stream_ids,
                 retry_count=retry_count + 1,
+                request_id=request_id,
+                _defer_tools=False,
+                _deferred_token=_deferred_token,
             )
             return True
         except BaseException:
@@ -28559,6 +29127,12 @@ def _schedule_idle_postcommit_snapshot(
         # lease here or it would pin fans until process exit.
         _end_smart_fan_request(state, fan_lease)
         raise
+    def _cancelled_before_start(done: Any) -> None:
+        if done.cancelled():
+            _end_smart_fan_request(state, fan_lease)
+            _log({"stored": False, "mode": "cancelled", "reason": "postcommit_cancelled_before_start"})
+
+    future.add_done_callback(_cancelled_before_start)
     # Stash the future on the EngineSession so the next request in this
     # session can wait briefly for it before acquiring the session lock.
     # The wait is bounded and best-effort: if the postcommit raises or
@@ -29621,6 +30195,11 @@ def _build_mtp_batch_session_hooks(
                             session_bank, "checkpoint_budget_bytes", None
                         ),
                     ),
+                    explicit_cache_boundary=(
+                        getattr(entry, "explicit_cache_boundary", None)
+                        if (getattr(entry, "explicit_cache_boundary", None) or 0) <= restore_point
+                        else None
+                    ),
                 )
             return None
         except Exception as exc:
@@ -29670,6 +30249,7 @@ def _build_mtp_batch_session_hooks(
                 snapshot_epoch=len(tokens),
                 mtp_snapshot_epoch=len(tokens) if mtp_snapshot is not None else None,
                 gdn_boundaries=list(gdn_boundaries or []),
+                explicit_cache_boundary=getattr(restored, "explicit_cache_boundary", None),
             )
             request_observability["mtp_batch_prompt_boundary_bank_stored"] = (
                 entry is not None
@@ -30563,6 +31143,34 @@ def _run_generation_dispatched(
     response_id: str | None = None,
     **kwargs: Any,
 ) -> dict[str, Any]:
+    if not _tool_postcommit_enabled(state):
+        return _run_generation_dispatched_impl(
+            state, prompt_ids, batch_key=batch_key, response_id=response_id, **kwargs
+        )
+    session_id = kwargs.get("session_id")
+    request_id = response_id or f"generation-{uuid.uuid4().hex}"
+    try:
+        _hold_tool_postcommit(state, session_id, request_id)
+        receipt = {"entry": _tool_postcommit_work_snapshot(state)}
+        generated = _run_generation_dispatched_impl(
+            state, prompt_ids, batch_key=batch_key, response_id=response_id, **kwargs
+        )
+    except BaseException:
+        _tool_postcommit_failed(state, session_id, request_id)
+        raise
+    receipt["exit"] = _tool_postcommit_work_snapshot(state)
+    generated.setdefault("stats", {})["tool_postcommit_work"] = receipt
+    return generated
+
+
+def _run_generation_dispatched_impl(
+    state: ServerState,
+    prompt_ids: list[int],
+    *,
+    batch_key: str,
+    response_id: str | None = None,
+    **kwargs: Any,
+) -> dict[str, Any]:
     effective_mode = _normalize_generation_mode(
         kwargs.get("generation_mode"),
         default=getattr(state.args, "generation_mode", "mtp"),
@@ -31183,6 +31791,14 @@ def _run_generation(
         try:
             if cancel_event is not None and cancel_event.is_set():
                 raise _StreamCancelled("request cancelled before generation")
+            prepare_native = getattr(session_bank, "prepare_native_continuation", None)
+            scheduler = getattr(state, "model_scheduler", None)
+            if (
+                _tool_postcommit_enabled(state) and session_id and vision_splice is None
+                and callable(prepare_native)
+                and scheduler is not None and scheduler.is_owner_thread()
+            ):
+                prepare_native(session_id=session_id, token_ids=prompt_ids)
             if request_observability is not None:
                 # Was the GPU working set resident when this prefill started?
                 # A cold `warm=false` is the ~9 ms/GiB residency rebuild
@@ -31245,6 +31861,7 @@ def _run_generation(
                 restore_identity=admission_restore_identity,
                 pricing=admission_pricing,
                 wide_prefill_rungs=wide_prefill_rungs,
+                required_boundary=(request_observability or {}).get("explicit_cache_boundary"),
             )
             if admission_shed is not None and request_observability is not None:
                 request_observability["prefill_admission_shed"] = admission_shed
@@ -31286,6 +31903,8 @@ def _run_generation(
             # The whole answer, priced before the prefill: the one refusal
             # comes here, never mid-stream; when only a shorter answer fits,
             # the request runs with that limit and says so if it reaches it.
+            if request_observability is not None:
+                request_observability["prefill_admission_growth"] = dict(admission_pricing.get("growth") or {})
             answer_room = _answer_room(
                 state,
                 prompt_ids=prompt_ids,
@@ -31614,7 +32233,14 @@ def _run_generation(
                 state,
                 final_state,
                 token_count=len(bank_token_ids),
+                keep_live_ref=session_keep_live_ref,
             )
+            if _tool_postcommit_enabled(state):
+                bank_metadata["prefer_live_ref"] = True
+                bank_metadata["native_stable_prefix_len"] = (request_observability or {}).get("stable_prefix_len")
+                bank_metadata["native_owned"] = (
+                    stats.get("cache_source") == "none" and stats.get("session_cache_hit") is False
+                )
             session_bank.put(
                 runtime=state.runtime,
                 token_ids=bank_token_ids,
@@ -35663,6 +36289,35 @@ def _thinking_guard_config_for_request(
     obs = request_observability or {}
     if not bool(obs.get("request_enable_thinking")):
         return None
+    explicit_budget = obs.get("request_thinking_token_budget")
+    if explicit_budget is not None:
+        from mtplx.loop_guard import tool_call_marker_ids
+        from mtplx.thinking_budget import HardThinkingBudgetConfig
+
+        tokenizer = state.runtime.tokenizer
+        markers = think_marker_ids(tokenizer)
+        if markers is None:
+            raise HTTPException(status_code=400, detail="thinking_token_budget requires atomic thinking markers")
+        try:
+            forced = tokenizer.encode("</think>\n\n", add_special_tokens=False)
+        except TypeError:
+            forced = tokenizer.encode("</think>\n\n")
+        if not forced or int(forced[0]) != int(markers[1]):
+            raise HTTPException(status_code=400, detail="thinking_token_budget cannot encode the thinking close sequence")
+        last_marker = next((int(t) for t in reversed(prompt_ids) if int(t) in markers), None)
+        tool_markers = tool_call_marker_ids(tokenizer)
+        return HardThinkingBudgetConfig(
+            enabled=True,
+            think_open_token=int(markers[0]),
+            think_close_token=int(markers[1]),
+            budget_tokens=int(explicit_budget),
+            forced_close_ids=tuple(int(t) for t in forced),
+            starts_in_think=last_marker == int(markers[0]),
+            mask_open_token=tool_markers[0] if tool_markers else None,
+            mask_close_token=tool_markers[1] if tool_markers else None,
+            reentry_ban_tokens=0,
+            novelty_close=False,
+        )
     try:
         tool_count = int(obs.get("request_tool_count") or 0)
     except (TypeError, ValueError):
@@ -37685,6 +38340,17 @@ def create_app(state: ServerState) -> FastAPI:
     async def chat_completions(
         raw_request: Request, request: ChatCompletionRequest
     ) -> Any:
+        try:
+            return await _chat_completions_impl(raw_request, request)
+        except BaseException:
+            paused = getattr(raw_request.state, "tool_postcommit_hold", None)
+            if paused is not None:
+                _tool_postcommit_failed(state, *paused)
+            raise
+
+    async def _chat_completions_impl(
+        raw_request: Request, request: ChatCompletionRequest
+    ) -> Any:
         _handler_start_s = time.perf_counter()
         request_received_monotonic_s = _handler_start_s
         # The server-side TTFT starts at HTTP arrival (body read and parse
@@ -37694,6 +38360,10 @@ def create_app(state: ServerState) -> FastAPI:
             request_received_monotonic_s = _arrival_s
         if not request.messages:
             raise HTTPException(status_code=400, detail="messages must not be empty")
+        if "prompt_cache_breakpoint" in (request.model_extra or {}):
+            raise HTTPException(status_code=400, detail="prompt_cache_breakpoint belongs on a text content part")
+        request = request.model_copy(update={"messages": _prepare_explicit_cache_breakpoint(request.messages)})
+        explicit_cache_breakpoint_requested = any(message._mtplx_cache_breakpoint is not None for message in request.messages)
         first_token_logprobs_top_k = _chat_first_token_logprobs_top_k(request)
         if first_token_logprobs_top_k is not None:
             _reject_unservable_first_token_logprobs(
@@ -37745,6 +38415,10 @@ def create_app(state: ServerState) -> FastAPI:
         )
         created = int(time.time())
         if _is_opencode_title_request(request):
+            if request.thinking_token_budget is not None:
+                raise HTTPException(status_code=400, detail="thinking_token_budget is not supported by the title fast path")
+            if explicit_cache_breakpoint_requested:
+                raise HTTPException(status_code=400, detail="prompt_cache_breakpoint is not supported by the title fast path")
             return _opencode_title_response(
                 state,
                 request,
@@ -37837,6 +38511,16 @@ def create_app(state: ServerState) -> FastAPI:
             state, effective_mode=request_generation_mode
         )
         mtp_batch_finalize_ownership = MTPBatchFinalizeOwnership()
+        if explicit_cache_breakpoint_requested:
+            trunk = getattr(state.runtime, "model", None)
+            trunk = getattr(trunk, "language_model", trunk)
+            model_type = getattr(getattr(trunk, "args", None), "model_type", None)
+            if (
+                cache_bypass or background or aime_visible_working
+                or _scheduler_config_from_args(state.args).mode != SchedulerMode.SERIAL
+                or model_type not in {"qwen3_5", "qwen3_5_text", "qwen3_5_moe", "qwen3_5_moe_text"}
+            ):
+                raise HTTPException(status_code=400, detail="prompt_cache_breakpoint requires the serial Qwen3.5 text cache path")
         try:
             constraint_spec = constraint_spec_from_response_format(
                 request.response_format,
@@ -37878,6 +38562,14 @@ def create_app(state: ServerState) -> FastAPI:
             )
         except ValueError as vision_error:
             raise HTTPException(status_code=400, detail=str(vision_error))
+        if request.thinking_token_budget is not None and thinking_enabled:
+            if (
+                background or vision_images or aime_visible_working
+                or constraint_spec is not None
+                or getattr(state.runtime, "backend_id", None) == "gemma4_assistant"
+                or _scheduler_config_from_args(state.args).mode != SchedulerMode.SERIAL
+            ):
+                raise HTTPException(status_code=400, detail="thinking_token_budget requires unconstrained serial text generation")
         vision_splice = None
         if vision_images:
             if _server_vision_spec(state) is None:
@@ -37907,6 +38599,8 @@ def create_app(state: ServerState) -> FastAPI:
             tool_prompt_mode=template_tool_prompt_mode,
             template_observability=template_observability,
         )
+        if explicit_cache_breakpoint_requested and "explicit_cache_boundary" not in template_observability:
+            raise HTTPException(status_code=400, detail="prompt_cache_breakpoint was removed during request normalization")
         ttft_clock.mark("encode")
         resolved_session_id: str | None = None
         resolved_session_source: str | None = None
@@ -37969,6 +38663,13 @@ def create_app(state: ServerState) -> FastAPI:
                 resolved_session_id = None
                 resolved_session_source = None
             ttft_clock.mark("session_resolve")
+            if not explicit_cache_breakpoint_requested and _short_stateless_cache_request(
+                messages=request.messages, prompt_tokens=len(prompt_ids),
+                tools_active=bool(request.tools), session_source=resolved_session_source,
+            ) and not vision_images:
+                cache_bypass = True
+                resolved_session_id = None
+                template_observability["short_prompt_cache_bypass"] = True
             # Canon-after-wait (2026-08-21): the committed-reasoning gate
             # below peeks the session's committed stream, but the pending
             # postcommit sweep + wait used to run ~690 lines later — every
@@ -37988,6 +38689,8 @@ def create_app(state: ServerState) -> FastAPI:
                 vision_session_restore is None
                 or resolved_session_source not in _VISION_LINEAGE_OVERRIDE_SOURCES
             ):
+                if _pause_tool_postcommit(state, resolved_session_id, response_id):
+                    raw_request.state.tool_postcommit_hold = (resolved_session_id, response_id)
                 early_postcommit_handled = True
                 _early_sweep = getattr(
                     getattr(state, "sessions", None),
@@ -38113,6 +38816,8 @@ def create_app(state: ServerState) -> FastAPI:
             elif _canonicalized is not None:
                 messages_for_generation, prompt_ids = _canonicalized
             ttft_clock.mark("canonicalize")
+        if explicit_cache_breakpoint_requested:
+            _refresh_explicit_cache_boundary(state.runtime.tokenizer, prompt_ids, template_observability)
         if vision_images and vision_splice is None:
             # Off the event loop (#487): the tower forwards for every image
             # of the prompt ran inside this coroutine, so a history whose
@@ -38403,6 +39108,11 @@ def create_app(state: ServerState) -> FastAPI:
                 if bank_session_id:
                     session_id, session_source = bank_session_id, "vision_bank_prefix"
                     resolved_session_diagnostic.clear()
+            paused = getattr(raw_request.state, "tool_postcommit_hold", None)
+            if paused is not None and paused[0] != session_id:
+                _tool_postcommit_failed(state, *paused)
+            _pause_tool_postcommit(state, session_id, response_id)
+            raw_request.state.tool_postcommit_hold = (session_id, response_id)
             session = state.sessions.get_or_create(session_id)
             session.last_cache_miss_reason = cache_miss_reason
             session.last_restore_mode = session_restore_mode
@@ -38605,8 +39315,10 @@ def create_app(state: ServerState) -> FastAPI:
                 )
             if acquired_session is session:
                 return
+            _tool_postcommit_failed(state, session_id, response_id)
             session = acquired_session
             session_id = session.session_id
+            raw_request.state.tool_postcommit_hold = (session_id, response_id)
             session_keep_live_ref = False
             request_observability["request_session_forked_busy"] = True
             request_observability["request_session_keep_live_ref"] = False
@@ -38708,6 +39420,23 @@ def create_app(state: ServerState) -> FastAPI:
                     )
                 return generated_result
 
+        def defer_tool_history(
+            generated: dict[str, Any], *, assistant_content: str,
+            assistant_tool_calls: list[dict[str, Any]],
+        ) -> dict[str, Any]:
+            return _schedule_idle_postcommit_snapshot(
+                state, session_id=session_id, messages=raw_messages_for_postcommit,
+                assistant_content=assistant_content, assistant_tool_calls=assistant_tool_calls,
+                thinking_enabled=thinking_enabled, reasoning_effort=reasoning_effort,
+                policy_fingerprint=postcommit_policy_fingerprint,
+                unsafe_reason="tool_call_history_deferred", tool_specs=postcommit_tool_specs,
+                session=session, expected_session_revision=getattr(session, "revision", None),
+                keep_live_ref=session_keep_live_ref, tool_prompt_mode=postcommit_tool_prompt_mode,
+                strip_tool_call_preamble_text=strip_tool_call_preamble_text,
+                committed_stream_ids=list(prompt_ids) + list(generated.get("tokens") or ()),
+                request_id=response_id,
+            )
+
         async def store_postcommit_snapshot(
             generated: dict[str, Any],
             *,
@@ -38723,6 +39452,28 @@ def create_app(state: ServerState) -> FastAPI:
                 generated.setdefault("stats", {})["session_postcommit_snapshot"] = {
                     "stored": False,
                     "reason": "vision_session_cache_disabled",
+                }
+                return
+            if not assistant_tool_calls:
+                _release_tool_postcommit(state, session_id, request_id=response_id)
+            elif _tool_postcommit_enabled(state):
+                compatibility = _generation_final_postcommit_compatibility(
+                    state, prompt_ids=prompt_ids, generated=generated,
+                    messages=raw_messages_for_postcommit, assistant_content=assistant_content,
+                    assistant_tool_calls=assistant_tool_calls, thinking_enabled=thinking_enabled,
+                    reasoning_effort=reasoning_effort, tool_specs=postcommit_tool_specs,
+                    tool_prompt_mode=postcommit_tool_prompt_mode,
+                    strip_tool_call_preamble_text=strip_tool_call_preamble_text,
+                    session=session, defer_tool_history=True,
+                )
+                # Nonstream generation already banked its exact live frontier.
+                generated["stats"]["session_postcommit_snapshot"] = {
+                    **defer_tool_history(generated, assistant_content=assistant_content,
+                                         assistant_tool_calls=assistant_tool_calls),
+                    "ram": {
+                        "stored": bool(compatibility.get("safe") and generated["stats"].get("sessionbank_snapshot_bytes")),
+                        "mode": compatibility["mode"], "reason": compatibility["reason"],
+                    },
                 }
                 return
             started = time.perf_counter()
@@ -38948,8 +39699,22 @@ def create_app(state: ServerState) -> FastAPI:
 
         ttft_clock.mark("prologue")
         if request.stream:
+            stream_worker_started = False
 
             async def event_stream():
+                stream = stream_events()
+                try:
+                    async for chunk in stream:
+                        yield chunk
+                finally:
+                    try:
+                        await stream.aclose()
+                    finally:
+                        if not stream_worker_started:
+                            _tool_postcommit_failed(state, session_id, response_id)
+
+            async def stream_events():
+                nonlocal stream_worker_started
                 stream_started_s = time.perf_counter()
                 last_sse_sent_s = stream_started_s
                 first_delta_marked = False
@@ -39773,6 +40538,8 @@ def create_app(state: ServerState) -> FastAPI:
                     Runs on the event loop before the terminal frame, or on the
                     stream worker after it when the frame went out first.
                     """
+                    if generated.get("_released_postcommit_finished"):
+                        return
                     prompt_prefix_boundary_kind = (
                         "tool_call_prompt_prefix"
                         if assistant_tool_calls
@@ -39856,6 +40623,8 @@ def create_app(state: ServerState) -> FastAPI:
                     generated["stats"][
                         "session_prompt_prefix_commit"
                     ] = prompt_prefix_commit_info
+                    if not assistant_tool_calls:
+                        _release_tool_postcommit(state, session_id, request_id=response_id)
                     unsafe_reason = str(
                         postcommit.get("reason") or "unsafe_history"
                     )
@@ -39877,6 +40646,7 @@ def create_app(state: ServerState) -> FastAPI:
                     else:
                         postcommit_snapshot = _schedule_idle_postcommit_snapshot(
                             state,
+                            request_id=response_id,
                             session_id=session_id,
                             messages=raw_messages_for_postcommit,
                             assistant_content=(
@@ -39908,6 +40678,7 @@ def create_app(state: ServerState) -> FastAPI:
                     generated["stats"][
                         "session_postcommit_snapshot"
                     ] = postcommit_snapshot
+                    generated["_released_postcommit_finished"] = True
 
                 def hand_off_commit(
                     kind: str,
@@ -39918,6 +40689,27 @@ def create_app(state: ServerState) -> FastAPI:
                     terminal frame already went out, finish it here on the
                     worker and land the outcome in this request's row."""
 
+                    if not commit_state.get("assistant_tool_calls"):
+                        _release_tool_postcommit(state, session_id, request_id=response_id)
+                    if kind == "committed" and commit_state.get("assistant_tool_calls") and _tool_postcommit_enabled(state):
+                        ram = generated["stats"].get("session_postcommit_snapshot")
+                        generated["stats"]["session_postcommit_snapshot"] = {
+                            **defer_tool_history(
+                                generated, assistant_content=str(commit_state.get("assistant_history_content") or ""),
+                                assistant_tool_calls=commit_state["assistant_tool_calls"],
+                            ),
+                            "ram": ram,
+                        }
+                    if kind == "released":
+                        finish_released_commit(
+                            generated, postcommit or {},
+                            assistant_history_content=str(commit_state.get("assistant_history_content") or ""),
+                            assistant_tool_calls=commit_state.get("assistant_tool_calls"),
+                        )
+                    if commit_state.get("tool_terminal_commit"):
+                        receipt = generated.get("stats", {}).get("tool_postcommit_work")
+                        if isinstance(receipt, dict):
+                            receipt["exit"] = _tool_postcommit_work_snapshot(state)
                     if not commit_state.get("early"):
                         if kind == "committed":
                             queue.put(("committed", generated))
@@ -40083,7 +40875,9 @@ def create_app(state: ServerState) -> FastAPI:
                                         int(token)
                                         for token in (generated.get("tokens") or [])
                                     ]
-                                    if bool(commit_state.get("retokenize_inline")):
+                                    if bool(commit_state.get("retokenize_inline")) and not (
+                                        assistant_tool_calls and _tool_postcommit_enabled(state)
+                                    ):
                                         postcommit = _submit_foreground_model_work(
                                             state,
                                             lambda: _store_retokenized_history_snapshot(
@@ -40224,6 +41018,7 @@ def create_app(state: ServerState) -> FastAPI:
                     else:
                         queue.put(("done", generated))
                     finally:
+                        _tool_postcommit_failed(state, session_id, response_id)
                         # After the generation slot was released: the next
                         # request of this session may now read and take it.
                         tail = commit_state.get("tail")
@@ -40251,6 +41046,7 @@ def create_app(state: ServerState) -> FastAPI:
                     name=f"mtplx-stream-worker-{response_id[-8:]}",
                     daemon=True,
                 ).start()
+                stream_worker_started = True
 
                 # The envelope around each delta is constant for the whole
                 # stream; serialize it once instead of rebuilding and
@@ -41588,8 +42384,15 @@ def create_app(state: ServerState) -> FastAPI:
                                 commit_state["retokenize_inline"] = (
                                     state.args.session_postcommit_mode == "inline"
                                 )
+                                # Tool completion includes its cheap RAM publication;
+                                # history rewriting and persistence remain deferred.
+                                commit_state["tool_terminal_commit"] = bool(
+                                    _tool_postcommit_enabled(state)
+                                    and (assistant_tool_calls or generated.get("finish_reason") == "tool_calls")
+                                )
                                 early_terminal_frame = bool(
                                     not commit_state["retokenize_inline"]
+                                    and not commit_state["tool_terminal_commit"]
                                     and _stream_terminal_frame_before_commit_enabled()
                                     and _session_named_by_client(session_source)
                                     and hasattr(session, "begin_response_tail")
@@ -42594,6 +43397,8 @@ def create_app(state: ServerState) -> FastAPI:
 
     @app.post("/v1/completions")
     async def completions(raw_request: Request, request: CompletionRequest) -> Any:
+        if "prompt_cache_breakpoint" in (request.model_extra or {}):
+            raise HTTPException(status_code=400, detail="prompt_cache_breakpoint belongs on a chat text content part")
         # The same span clock as chat (request_spans): arrival, the prologue,
         # the engine's marks, and the first text written to the stream.
         _handler_start_s = time.perf_counter()

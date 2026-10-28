@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import heapq
 from collections import Counter, OrderedDict, deque
 import json
 import logging
@@ -171,6 +172,7 @@ class ColdRestoreRecord:
     # decoded KV only covers the boundary it will actually serve.
     cache_snapshot_prefix_len: int | None = None
     mtp_history_snapshot_prefix_len: int | None = None
+    explicit_cache_boundary: int | None = None
 
 
 @dataclass(frozen=True)
@@ -313,8 +315,8 @@ def block_aligned_prefix_len(matched_tokens: int, *, block_size: int) -> int:
     return (matched // block) * block
 
 
-# Ranked SSD rows a prefix lookup opens before it gives up: each refusal
-# costs only its payload.json read.
+# Tensor restore attempts after prefix metadata ranking; metadata-only
+# refusals do not consume the budget.
 _PREFIX_BOUNDARY_ROWS_TRIED = 4
 
 
@@ -534,6 +536,7 @@ class SessionBankColdTier:
             "last_miss_reason": None,
             "last_archive_path": None,
             "encode_yields_foreground": 0,
+            "spill_resumed_blobs": 0,
             # Issue #505: the owner-thread encode in units. The longest unit
             # is the longest a request can have waited behind this tier, so
             # a stall names itself here instead of in a watchdog line.
@@ -640,6 +643,7 @@ class SessionBankColdTier:
                 mtp_history_snapshot=getattr(entry, "mtp_history_snapshot", None),
                 gdn_boundaries=boundaries,
                 has_recurrent=bool(getattr(entry, "has_recurrent", False)),
+                explicit_cache_boundary=getattr(entry, "explicit_cache_boundary", None),
                 block_size=self.block_size,
                 should_abort=should_abort,
                 on_unit=self._observe_encode_unit,
@@ -887,6 +891,9 @@ class SessionBankColdTier:
             self._release_inflight(entry_dirs=(entry_dir_rel,), digests=claimed_digests)
             self._release_reserved(estimated)
         if stored:
+            progress = getattr(entry, "_cold_spill_progress", None)
+            if progress is not None:
+                progress.clear()
             # Only now, with the new entry installed, may anything older
             # (the entry it replaces included) be retired for the cap.
             self._settle_to_cap(keep=entry_id, on_yield=yield_to_foreground)
@@ -932,6 +939,7 @@ class SessionBankColdTier:
         claimed_digests: set[str],
     ) -> bool:
         should_abort = self.encode_should_abort()
+        resume = getattr(entry, "_cold_spill_progress", None)
         tensor_blobs: dict[str, dict[str, Any]] = {}
         written_state = {"logical": 0, "physical": 0, "deduped_hits": 0}
         tier = self
@@ -977,11 +985,15 @@ class SessionBankColdTier:
                     written_state["physical"] += len(raw)
                 else:
                     written_state["deduped_hits"] += 1
+                if resume is not None:
+                    key, source = codec.resume_sources[name]
+                    resume[key] = (source, tensor_blobs[name])
 
         codec = TreeCodec(
             block_size=self.block_size,
             should_abort=should_abort,
             on_unit=self._observe_encode_unit,
+            resume=resume,
         )
         codec.tensors = _WriteThroughTensors()
         boundaries = tuple(
@@ -989,6 +1001,17 @@ class SessionBankColdTier:
             for r in (getattr(entry, "gdn_boundaries", None) or [])
         )
         try:
+            # Orphan cleanup may have removed an interrupted spill's blobs.
+            # Validate and claim them atomically before skipping their copies.
+            for key, (source, blob) in list((resume or {}).items()):
+                codec._check_abort()
+                digest = str(blob["sha256"])
+                with self._base_lock:
+                    if source() is None or not self._blob_path(digest).exists():
+                        resume.pop(key, None)
+                    elif digest not in claimed_digests:
+                        claimed_digests.add(digest)
+                        self._claim_inflight(digests={digest})
             payload_spec = build_payload_spec(
                 codec,
                 cache_snapshot=getattr(entry, "cache_snapshot"),
@@ -997,6 +1020,7 @@ class SessionBankColdTier:
                 mtp_history_snapshot=getattr(entry, "mtp_history_snapshot", None),
                 gdn_boundaries=boundaries,
                 has_recurrent=bool(getattr(entry, "has_recurrent", False)),
+                explicit_cache_boundary=getattr(entry, "explicit_cache_boundary", None),
             )
         except ColdEncodeInterrupted:
             self._inc("encode_yields_foreground")
@@ -1015,6 +1039,9 @@ class SessionBankColdTier:
                 "SessionBank SSD spill skipped: %s: %s", type(exc).__name__, exc
             )
             return False
+        tensor_blobs.update(codec.reused)
+        self._inc("spill_resumed_blobs", len(codec.reused))
+        written_state["logical"] = sum(int(blob["nbytes"]) for blob in tensor_blobs.values())
         if should_abort is not None:
             # Same fencing rationale as put_entry: the per-tensor evals
             # above schedule GPU work whose command buffers must drain in
@@ -1081,6 +1108,7 @@ class SessionBankColdTier:
         mtp_history_policy: str | None = None,
         draft_head_identity: str | None = None,
         policy_fingerprint: str | None = None,
+        required_boundary: int | None = None,
     ) -> ColdRestoreRecord | None:
         if self.mode == "off":
             self._set_last_miss("ssd_cache_off")
@@ -1106,7 +1134,9 @@ class SessionBankColdTier:
                 policy_fingerprint=policy_fingerprint,
             )
             for row in rows:
-                record = self._restore_row(row, tokens, started_s=started)
+                record = self._restore_row(
+                    row, tokens, started_s=started, required_boundary=required_boundary
+                )
                 if record is not None:
                     return record
         except Exception as exc:
@@ -1140,18 +1170,16 @@ class SessionBankColdTier:
         # resident_duplicates: token_hash -> {prefix_len, has_mtp_history}
         # for RAM entries the caller has ALREADY proven identity-compatible
         # with this request, snapshot-capable (never live-ref-only), and
-        # recurrent-boundary-covered. The metadata scan below runs exactly
-        # as before, but when the best cold row IS one of those resident
+        # recurrent-boundary-covered. After ranking reachable prefixes,
+        # when the best cold row IS one of those resident
         # entries (same token hash and stored length, and the resident copy
         # matches the row's committed-MTP coverage), the lookup returns
         # no-candidate BEFORE _restore_row: fully hydrating a candidate the
         # caller's stable sort would resolve to its RAM twin anyway is pure
         # request-path waste (measured 0.66-1.17s per warm turn, probe pair
         # 2026-08-06). A cold row with NO serve-equivalent resident twin —
-        # different tokens, longer prefix, missing coverage in RAM — always
-        # hydrates as before, so cold-only recovery and strictly-better-cold
-        # behavior are unchanged, and an ineligible RAM match can never
-        # shadow a valid cold candidate.
+        # different tokens, longer prefix, missing coverage in RAM — remains
+        # eligible, so an ineligible RAM match cannot shadow a cold candidate.
         if self.mode == "off":
             self._set_last_miss("ssd_cache_off")
             return None
@@ -1202,7 +1230,8 @@ class SessionBankColdTier:
                     candidate_matched = int(matched)
                     restore_kind = "near_prefix"
                 elif block_match:
-                    candidate_matched = int(safe_block)
+                    # The decoder slices blocks; recurrent checkpoints need not align.
+                    candidate_matched = int(matched)
                     restore_kind = "block_prefix"
                 else:
                     continue
@@ -1219,42 +1248,50 @@ class SessionBankColdTier:
                 self._inc("restore_misses")
                 self._set_last_miss("ssd_prefix_miss")
                 return None
-            ranked.sort(key=lambda item: item[0], reverse=True)
-            if int(min_useful_matched_tokens) > 0 and ranked[0][2] < int(
-                min_useful_matched_tokens
-            ):
-                # The caller's best RAM candidate already matches more
-                # tokens than this row possibly can — the stable sort would
-                # discard the hydrated result unread. Skip the multi-GB
-                # request-path hydration entirely. Equal-matched rows fall
-                # through to the resident-duplicate shadow (and may still
-                # legitimately hydrate when no twin covers them), so
-                # strictly-better-cold and cold-only recovery semantics are
-                # untouched.
-                self._inc("prefix_lookups_not_better_than_ram")
-                self._set_last_miss("ssd_prefix_not_better_than_ram")
-                return None
-            # Best first; a row that cannot serve (a hybrid entry with no
-            # recurrent boundary at or below its match, a format or epoch
-            # mismatch) is refused by _restore_row before any tensor is read,
-            # and the next one is tried: a new conversation shares its system
-            # prompt with every older one, and the longest of them is often a
-            # conversation without a boundary there.
-            for _key, row, candidate_matched, restore_kind, prefix_len in ranked[
-                :_PREFIX_BOUNDARY_ROWS_TRIED
-            ]:
-                if candidate_matched < int(min_useful_matched_tokens):
-                    # Ranked best first: this row and every later one are
-                    # under the caller's RAM match.
+            # Raw matches are upper bounds. Resolve only metadata until the
+            # best reachable prefix wins, then hydrate that candidate alone.
+            pending = [(tuple(-v for v in item[0]), i, False, item)
+                       for i, item in enumerate(ranked)]
+            heapq.heapify(pending)
+            restores = 0
+            while pending and restores < _PREFIX_BOUNDARY_ROWS_TRIED:
+                priority, index, checked, item = heapq.heappop(pending)
+                _key, row, candidate_matched, restore_kind, prefix_len = item
+                if -priority[0] < int(min_useful_matched_tokens):
                     self._inc("prefix_lookups_not_better_than_ram")
                     self._set_last_miss("ssd_prefix_not_better_than_ram")
                     return None
+                if not checked:
+                    payload_path = self.base_dir / str(row["entry_dir"]) / "payload.json"
+                    try:
+                        payload_spec = json.loads(payload_path.read_text(encoding="utf-8"))["payload_spec"]
+                    except (OSError, ValueError, KeyError):
+                        self._inc("corrupt_entries")
+                        self._set_last_miss("ssd_payload_missing_or_invalid")
+                        continue
+                    reachable = candidate_matched
+                    if payload_spec.get("has_recurrent", False):
+                        boundary = _payload_boundary_at_or_below(payload_spec, candidate_matched)
+                        if boundary is None:
+                            from mtplx.session_bank import _boundary_true_restore_enabled
+
+                            if _boundary_true_restore_enabled():
+                                self._inc("prefix_restores_without_boundary")
+                                self._set_last_miss("ssd_prefix_no_recurrent_boundary")
+                                continue
+                        else:
+                            reachable = boundary
+                    heapq.heappush(pending, (
+                        (-reachable, priority[1], priority[2]), index, True, item,
+                    ))
+                    continue
                 if resident_duplicates and self._shadowed_by_resident_duplicate(
                     row, prefix_len, resident_duplicates
                 ):
                     self._inc("prefix_lookups_shadowed_by_ram")
                     self._set_last_miss("ssd_prefix_shadowed_by_resident_duplicate")
                     return None
+                restores += 1
                 record = self._restore_row(
                     row,
                     tokens,
@@ -1547,6 +1584,10 @@ class SessionBankColdTier:
         )
         digest.update(str(int(getattr(entry, "snapshot_epoch", 0) or 0)).encode("ascii"))
         digest.update(str(int(getattr(entry, "mtp_snapshot_epoch", 0) or 0)).encode("ascii"))
+        boundary = getattr(entry, "explicit_cache_boundary", None)
+        if boundary is not None:
+            # A new marker must publish even when these tokens/epochs already exist.
+            digest.update(f":explicit_cache_boundary:{int(boundary)}".encode("ascii"))
         return digest.hexdigest()[:32]
 
     def is_published(self, entry: Any) -> bool:
@@ -1692,6 +1733,8 @@ class SessionBankColdTier:
                 )
             finally:
                 self._release_pending(pending.pinned_nbytes)
+                # Release encoded bytes before blocking for the next write.
+                del pending
                 self._queue.task_done()
 
     def _admit_write(self, estimated_nbytes: int) -> bool:
@@ -2662,6 +2705,7 @@ class SessionBankColdTier:
         require_exact_prefix: bool = True,
         include_gdn_boundaries: bool = False,
         prefix_restore_tokens: int | None = None,
+        required_boundary: int | None = None,
     ) -> ColdRestoreRecord | None:
         metadata = dict(row)
         token_ids = tuple(int(token) for token in json.loads(str(metadata["token_ids_json"])))
@@ -2696,6 +2740,15 @@ class SessionBankColdTier:
             return path.read_bytes()
 
         payload_spec = payload["payload_spec"]
+        if (
+            required_boundary is not None
+            and payload_spec.get("has_recurrent", False)
+            and 0 < required_boundary < len(token_ids)
+            and _payload_boundary_at_or_below(payload_spec, required_boundary)
+            != required_boundary
+        ):
+            self._set_last_miss("explicit_cache_boundary_missing")
+            return None
         partial_restore = (
             prefix_restore_tokens is not None
             and not require_exact_prefix
@@ -2792,15 +2845,32 @@ class SessionBankColdTier:
         )
         metadata["capabilities"] = json.loads(str(metadata.get("capabilities_json") or "[]"))
         metadata["block_hashes"] = json.loads(str(metadata.get("block_hashes_json") or "[]"))
-        boundary_loader = (
-            None
-            if include_gdn_boundaries or partial_restore
-            else (
-                lambda should_abort=None: decode_gdn_boundaries(
-                    payload_spec, read_tensor, should_abort=should_abort
+        boundary_loader = None
+        frontier = decoded.cache_snapshot_prefix_len
+        if frontier is None:
+            frontier = len(token_ids)
+        eligible_boundaries = []
+        for record in payload_spec.get("gdn_boundaries") or []:
+            try:
+                position = int(record["tokens"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if 0 < position <= frontier:
+                eligible_boundaries.append(record)
+        boundary_spec = {"gdn_boundaries": eligible_boundaries}
+        loaded_positions = {int(r[0]) for r in decoded.gdn_boundaries}
+        if any(
+            int(record["tokens"]) not in loaded_positions
+            for record in boundary_spec["gdn_boundaries"]
+        ):
+            # A partial restore loads only its serving checkpoint. Keep the
+            # older manifest for bounded inheritance, never the old branch's tail.
+            def boundary_loader(should_abort=None, plan=None, existing_records=()):
+                return decode_gdn_boundaries(
+                    boundary_spec, read_tensor, should_abort=should_abort,
+                    plan=plan, existing_records=existing_records,
                 )
-            )
-        )
+            boundary_loader.positions = tuple(int(r["tokens"]) for r in eligible_boundaries)
         return ColdRestoreRecord(
             entry_id=str(metadata["entry_id"]),
             token_ids=token_ids,
@@ -2817,6 +2887,12 @@ class SessionBankColdTier:
             cache_snapshot_prefix_len=decoded.cache_snapshot_prefix_len,
             mtp_history_snapshot_prefix_len=(
                 decoded.mtp_history_snapshot_prefix_len
+            ),
+            explicit_cache_boundary=(
+                decoded.explicit_cache_boundary
+                if decoded.explicit_cache_boundary is not None
+                and decoded.explicit_cache_boundary <= frontier
+                else None
             ),
         )
 

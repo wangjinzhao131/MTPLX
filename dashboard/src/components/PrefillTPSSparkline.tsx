@@ -78,8 +78,8 @@ export function PrefillTPSSparkline() {
 
   return (
     <Card
-      title="Prefill tok/s · last 100"
-      subtitle={mean !== null ? `mean ${fmtTokS(mean)} tok/s` : "no prefill samples yet"}
+      title="预填充速度 · 最近 100 次"
+      subtitle={mean !== null ? `平均 ${fmtTokS(mean)} tok/s` : "暂无预填充样本"}
     >
       <div ref={wrapperRef} className="w-full" />
     </Card>

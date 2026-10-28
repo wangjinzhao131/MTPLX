@@ -1,4 +1,4 @@
-This fork adds opt-in Qwen 35B AR and 27B MTP kernels. See [local optimization profiles](docs/local-optimizations.md) for installation, launch commands, provenance, and validation. The upstream benchmark claims below describe upstream releases.
+This fork adds opt-in Qwen optimization profiles, Hermes-oriented cache and memory improvements, and a Chinese monitoring dashboard. See the [current development snapshot and validation limits](docs/hermes-ux-release.md) and [local optimization profiles](docs/local-optimizations.md). The upstream benchmark claims below describe upstream releases.
 
 <div align="center">
 

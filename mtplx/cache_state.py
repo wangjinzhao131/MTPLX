@@ -189,7 +189,7 @@ class TailOwnedKVCache:
 
 
 class BlockOwnedKVCache(TailOwnedKVCache):
-    """Full-attention KV cache with independent physical token blocks."""
+    """Full-attention KV with block-preserving snapshots and COW tails."""
 
     def __init__(
         self,
@@ -201,6 +201,8 @@ class BlockOwnedKVCache(TailOwnedKVCache):
         offset: int = 0,
     ) -> None:
         self.block_size = int(block_size)
+        if self.block_size <= 0:
+            raise ValueError("block_size must be positive")
         self.key_blocks: list[Any] = []
         self.value_blocks: list[Any] = []
         self._pending_keys = None
@@ -257,6 +259,14 @@ class BlockOwnedKVCache(TailOwnedKVCache):
             key_block, value_block = self._new_blocks_like(keys, values)
             self.key_blocks.append(key_block)
             self.value_blocks.append(value_block)
+        index = int(absolute_pos) // self.block_size
+        if int(self.key_blocks[index].shape[2]) < self.block_size:
+            # A partial SSD restore owns only the active rows of its last block.
+            old_keys, old_values = self.key_blocks[index], self.value_blocks[index]
+            key_block, value_block = self._new_blocks_like(keys, values)
+            key_block[..., : old_keys.shape[2], :] = old_keys
+            value_block[..., : old_values.shape[2], :] = old_values
+            self.key_blocks[index], self.value_blocks[index] = key_block, value_block
 
     def _finalize_block(self, block_index: int) -> None:
         import mlx.core as mx
@@ -398,16 +408,43 @@ class BlockOwnedKVCache(TailOwnedKVCache):
 
     @property
     def state(self):
-        return self._active_arrays()
+        count = (self.offset + self.block_size - 1) // self.block_size
+        return {
+            "kind": "mtplx_block_kv_v1",
+            "block_size": self.block_size,
+            "offset": self.offset,
+            "keys": tuple(self.key_blocks[:count]),
+            "values": tuple(self.value_blocks[:count]),
+        }
 
     @state.setter
     def state(self, value) -> None:
+        if _is_block_kv_state(value):
+            block_size, offset, keys, values = _validated_block_kv_state(value)
+            # Fresh array objects keep later setitem writes out of the donor.
+            self.key_blocks = [_lazy_state_view(block) for block in keys]
+            self.value_blocks = [_lazy_state_view(block) for block in values]
+            self.block_size = self.step = block_size
+            self.offset = offset
+            self._pending_keys = self._pending_values = None
+            if keys:
+                self._record_shape(keys[0], values[0])
+            return
+        if isinstance(value, dict):
+            raise ValueError("unsupported block KV state")
         keys, values = value
         self.key_blocks = []
         self.value_blocks = []
         self.offset = 0
         if keys is not None and values is not None:
             self._load_contiguous_state(keys, values, int(keys.shape[2]))
+
+    def trim(self, n: int) -> int:
+        trimmed = super().trim(n)
+        count = (self.offset + self.block_size - 1) // self.block_size
+        del self.key_blocks[count:]
+        del self.value_blocks[count:]
+        return trimmed
 
     @property
     def meta_state(self) -> tuple[str, ...]:
@@ -432,6 +469,46 @@ class BlockOwnedKVCache(TailOwnedKVCache):
         for key_block, value_block in zip(self.key_blocks, self.value_blocks):
             total += int(key_block.nbytes) + int(value_block.nbytes)
         return total
+
+
+def _is_block_kv_state(state: Any) -> bool:
+    return isinstance(state, dict) and state.get("kind") == "mtplx_block_kv_v1"
+
+
+def _validated_block_kv_state(state: dict[str, Any]) -> tuple[int, int, tuple, tuple]:
+    import mlx.core as mx
+
+    block_size, offset = state.get("block_size"), state.get("offset")
+    if type(block_size) is not int or block_size <= 0 or type(offset) is not int or offset < 0:
+        raise ValueError("invalid block KV geometry")
+    keys, values = state.get("keys"), state.get("values")
+    count = (offset + block_size - 1) // block_size
+    if (not isinstance(keys, (tuple, list)) or not isinstance(values, (tuple, list))
+            or len(keys) != count or len(values) != count):
+        raise ValueError("invalid block KV block count")
+    for index, (key, value) in enumerate(zip(keys, values)):
+        needed = min(block_size, offset - index * block_size)
+        if (not isinstance(key, mx.array) or not isinstance(value, mx.array)
+                or key.ndim != 4 or value.ndim != 4
+                or key.shape[:3] != value.shape[:3]
+                or not needed <= key.shape[2] <= block_size
+                or (index and (key.shape[:2] != keys[0].shape[:2]
+                    or key.shape[3] != keys[0].shape[3] or key.dtype != keys[0].dtype
+                    or value.shape[3] != values[0].shape[3] or value.dtype != values[0].dtype))):
+            raise ValueError("invalid block KV tensor layout")
+    return block_size, offset, tuple(keys), tuple(values)
+
+
+def _block_kv_contiguous_state(state: dict[str, Any]) -> tuple[Any, Any]:
+    import mlx.core as mx
+
+    _, offset, keys, values = _validated_block_kv_state(state)
+    if not keys:
+        return None, None
+    return tuple(
+        (parts[0] if len(parts) == 1 else mx.concatenate(parts, axis=2))[..., :offset, :]
+        for parts in (keys, values)
+    )
 
 
 def _vllm_metal_reference_path() -> Path:
@@ -4506,8 +4583,10 @@ def install_block_owned_attention_kv_cache(
             continue
         if isinstance(entry, BlockOwnedKVCache):
             entry.mode = normalized
-            entry.block_size = int(block_size)
-            entry.step = int(block_size)
+            # Restored blocks retain their physical geometry until empty.
+            if entry.empty():
+                entry.block_size = int(block_size)
+                entry.step = int(block_size)
             stats["entries"] = int(stats["entries"]) + 1
             continue
         if isinstance(entry, TailOwnedKVCache):
@@ -5019,7 +5098,11 @@ def restore_cache(
         if state is not None:
             install_view = not clone_states and _is_trimmable(entry)
             _restore_state_preserving_container(entry, state, clone=not install_view)
-        if restore_meta_state and meta_state is not None:
+        # Block state carries its geometry; legacy/native metadata belongs to
+        # its original layout and must not overwrite the restored geometry.
+        if (restore_meta_state and meta_state is not None
+                and not isinstance(entry, BlockOwnedKVCache)
+                and not _is_block_kv_state(state)):
             entry.meta_state = _clone_tree(meta_state)
 
 
@@ -5038,6 +5121,20 @@ def _restore_state_preserving_container(entry: Any, state: Any, *, clone: bool =
     # Containers with replace_state (owned recurrent) copy into owned buffers
     # and must always receive a full clone they are free to consume.
     cloned = _clone_tree(state) if clone else _lazy_state_view(state)
+    if isinstance(entry, BlockOwnedKVCache):
+        entry.state = cloned
+        return
+    if _is_block_kv_state(cloned):
+        from mlx_lm.models.cache import KVCache
+
+        if type(entry) not in (KVCache, TailOwnedKVCache):
+            raise ValueError("block KV snapshot requires a compatible attention cache")
+        keys, values = _block_kv_contiguous_state(cloned)
+        if keys is None:
+            entry.keys, entry.values, entry.offset = None, None, 0
+        else:
+            entry.state = (keys, values)
+        return
     if hasattr(entry, "replace_state"):
         entry.replace_state(cloned)
         return
@@ -5300,6 +5397,17 @@ def detach_attention_cache_state(
     normalized = _normalize_detach_mode(mode)
     for entry in cache:
         if not _is_trimmable(entry):
+            continue
+        if isinstance(entry, BlockOwnedKVCache):
+            if not entry.key_blocks:
+                continue
+            stats["entries"] += 1
+            for blocks in (entry.key_blocks, entry.value_blocks):
+                for index, block in enumerate(blocks):
+                    detached = detach_array_leaf(block, mode=normalized)
+                    blocks[index] = detached
+                    stats["arrays"] += 1
+                    stats["bytes"] += int(detached.nbytes)
             continue
         keys = getattr(entry, "keys", None)
         values = getattr(entry, "values", None)

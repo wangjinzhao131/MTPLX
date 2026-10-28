@@ -3,12 +3,12 @@ import { AnimatePresence, motion } from "motion/react";
 import { Keyboard, X } from "lucide-react";
 
 const SHORTCUTS: { key: string; label: string }[] = [
-  { key: "?", label: "Show / hide this overlay" },
-  { key: "t", label: "Cycle theme (hippo → river → light → mono)" },
-  { key: "g", label: "Go to next tab" },
-  { key: "space", label: "Pause / resume live updates" },
-  { key: "s", label: "Toggle new-max chime" },
-  { key: "Esc", label: "Close overlays" },
+  { key: "?", label: "显示或隐藏快捷键面板" },
+  { key: "t", label: "切换主题（河马 → 河流 → 明亮 → 单色）" },
+  { key: "g", label: "切换到下一个页面" },
+  { key: "space", label: "暂停或恢复实时更新" },
+  { key: "s", label: "开启或关闭新纪录提示音" },
+  { key: "Esc", label: "关闭浮层" },
 ];
 
 export function KeyboardShortcutsOverlay() {
@@ -32,7 +32,7 @@ export function KeyboardShortcutsOverlay() {
       <button
         type="button"
         onClick={() => setOpen(true)}
-        title="Keyboard shortcuts (?)"
+        title="键盘快捷键（?）"
         className="fixed bottom-16 right-4 z-30 inline-flex items-center justify-center rounded-full p-2 bg-[var(--bg-card)] border border-[var(--border-soft)] text-[var(--text-muted)] hover:text-[var(--text-primary)] shadow"
       >
         <Keyboard className="size-4" />
@@ -55,7 +55,7 @@ export function KeyboardShortcutsOverlay() {
             >
               <div className="flex items-center justify-between mb-4">
                 <h2 className="text-base font-semibold text-[var(--text-primary)]">
-                  Keyboard shortcuts
+                  键盘快捷键
                 </h2>
                 <button
                   type="button"

@@ -18,17 +18,16 @@ export function InFlightList() {
 
   return (
     <Card
-      title="In-flight requests"
+      title="正在处理的请求"
       subtitle={
         inFlight.length === 0
-          ? "no active generations"
-          : `${inFlight.length} active · cancel is best-effort`
+          ? "当前无生成任务"
+          : `${inFlight.length} 个处理中 · 取消需等待服务端响应`
       }
     >
       {inFlight.length === 0 ? (
         <div className="text-sm text-[var(--text-muted)]">
-          Drive load from any client (Web UI, hippo, OpenAI SDK) to see live
-          requests here.
+          从任意客户端发送请求后，这里会显示实时任务。
         </div>
       ) : (
         <ul className="divide-y divide-[var(--border-soft)] -mx-2">
@@ -60,7 +59,7 @@ export function InFlightList() {
                     {handle.prompt_preview || "—"}
                   </div>
                   <div className="text-xs text-[var(--text-muted)] flex flex-wrap gap-x-3 mt-1">
-                    <span>age {fmtSeconds(handle.age_s)}</span>
+                    <span>已用 {fmtSeconds(handle.age_s)}</span>
                     <span>{fmtNumber(tokens)} tok</span>
                     {typeof tokS === "number" && tokS > 0 ? (
                       <span className="text-[var(--accent)]">
@@ -76,7 +75,7 @@ export function InFlightList() {
                   disabled={cancel.isPending || handle.cancelled}
                 >
                   <Square className="size-3" />
-                  {handle.cancelled ? "cancelling" : "cancel"}
+                  {handle.cancelled ? "正在取消" : "取消"}
                 </button>
               </motion.li>
             );

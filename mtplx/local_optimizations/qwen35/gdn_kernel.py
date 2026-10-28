@@ -1,4 +1,4 @@
-"""Experimental B=1/S=1 GDN preprocessing kernel; weights stay unchanged.
+"""B=1/S=1–3 GDN preprocessing with optional prefix capture; weights stay unchanged.
 
 Arithmetic follows MLX v0.32.2 conv.metal, unary_ops.h and rms_norm.metal:
 FP32 convolution accumulation, dtype-rounded convolution/SiLU/RMSNorm/scale,
@@ -22,6 +22,7 @@ template <typename T> T gdn_sigmoid(T x) {
 """
 
 _SOURCE = """
+    const uint t = Tokens == 1 ? 0 : thread_position_in_grid.z;
     const uint head = thread_position_in_grid.y;
     const uint lane = thread_index_in_simdgroup;
     const bool is_qk = head < 2 * Hk;
@@ -37,15 +38,20 @@ _SOURCE = """
             const uint c = start + column;
             float acc = 0.0f;
             for (uint tap = 0; tap < 3; ++tap) {
-                acc += float(conv_state[tap * channels + c]) * weight[4 * c + tap];
+                const uint pos = t + tap;
+                T input = pos < 3 ? conv_state[pos * channels + c]
+                                  : qkv[(pos - 3) * channels + c];
+                acc += float(input) * weight[4 * c + tap];
             }
-            acc += float(qkv[c]) * weight[4 * c + 3];
+            acc += float(qkv[t * channels + c]) * weight[4 * c + 3];
             T convolved = T(acc);
             T sigmoid = gdn_sigmoid(convolved);
             values[i] = convolved * sigmoid;
-            next_conv[c] = conv_state[channels + c];
-            next_conv[channels + c] = conv_state[2 * channels + c];
-            next_conv[2 * channels + c] = qkv[c];
+            for (uint tap = 0; tap < 3; ++tap) {
+                const uint pos = t + tap + 1;
+                next_conv[(t * 3 + tap) * channels + c] = pos < 3
+                    ? conv_state[pos * channels + c] : qkv[(pos - 3) * channels + c];
+            }
         }
         float v = float(values[i]);
         squares += v * v;
@@ -60,9 +66,9 @@ _SOURCE = """
                 T normalized = T(float(values[i]) * inverse);
                 T scaled = normalized * scale;
                 if (head < Hk) {
-                    q[head * Dk + column] = scaled;
+                    q[(t * Hk + head) * Dk + column] = scaled;
                 } else {
-                    k[(head - Hk) * Dk + column] = scaled;
+                    k[(t * Hk + head - Hk) * Dk + column] = scaled;
                 }
             }
         }
@@ -70,7 +76,7 @@ _SOURCE = """
         for (uint i = 0; i < 4; ++i) {
             const uint column = 4 * lane + i;
             if (column < Dv) {
-                v[(head - 2 * Hk) * Dv + column] = values[i];
+                v[(t * Hv + head - 2 * Hk) * Dv + column] = values[i];
             }
         }
     }
@@ -83,17 +89,19 @@ _kernel = mx.fast.metal_kernel(
 )
 
 
-def preprocess(gdn, qkv, conv_state):
-    """Return normalized q/k, activated v and shifted convolution state."""
+def preprocess(gdn, qkv, conv_state, *, capture=False):
+    """Return normalized q/k, activated v and the final or every prefix conv state."""
     hk, hv = gdn.num_k_heads, gdn.num_v_heads
     dk, dv = gdn.head_k_dim, gdn.head_v_dim
     channels = 2 * hk * dk + hv * dv
     # shortcut: one SIMD group per head; support wider heads only when needed.
     if not (0 < dk <= 128 and 0 < dv <= 128 and dk % 4 == dv % 4 == 0):
         raise ValueError("GDN preprocessing needs head dimensions divisible by4 and <=128")
-    if (qkv.shape != (1, 1, channels) or conv_state.shape != (1, 3, channels)
+    tokens = qkv.shape[1] if qkv.ndim == 3 else 0
+    if (tokens not in ((1, 2, 3) if capture else (1,))
+            or qkv.shape != (1, tokens, channels) or conv_state.shape != (1, 3, channels)
             or gdn.conv1d.weight.shape != (channels, 4, 1)):
-        raise ValueError("GDN preprocessing needs B1/S1, four convolution taps and matching state")
+        raise ValueError("GDN preprocessing needs B1/S1 (S1–3 for capture), four convolution taps and matching state")
     if qkv.dtype not in (mx.float16, mx.float32) or not (
             qkv.dtype == conv_state.dtype == gdn.conv1d.weight.dtype):
         raise ValueError("GDN preprocessing needs matching FP16 or FP32 inputs")
@@ -101,16 +109,37 @@ def preprocess(gdn, qkv, conv_state):
     q_scale, k_scale = (dk ** -0.5) ** 2, dk ** -0.5
     return _kernel(
         inputs=[qkv, conv_state, gdn.conv1d.weight],
-        template=[("T", qkv.dtype), ("Hk", hk), ("Hv", hv), ("Dk", dk), ("Dv", dv),
+        template=[("T", qkv.dtype), ("Tokens", tokens), ("Hk", hk), ("Hv", hv), ("Dk", dk), ("Dv", dv),
                   ("QscaleBits", struct.unpack("<I", struct.pack("<f", q_scale))[0]),
                   ("KscaleBits", struct.unpack("<I", struct.pack("<f", k_scale))[0])],
-        grid=(32, 2 * hk + hv, 1), threadgroup=(32, 1, 1),
-        output_shapes=[(1, 1, hk, dk), (1, 1, hk, dk), (1, 1, hv, dv), conv_state.shape],
+        grid=(32, 2 * hk + hv, tokens), threadgroup=(32, 1, 1),
+        output_shapes=[(1, tokens, hk, dk), (1, tokens, hk, dk), (1, tokens, hv, dv),
+                       (1, tokens, 3, channels) if capture else conv_state.shape],
         output_dtypes=[qkv.dtype] * 4,
     )
 
 
 class _FusedGDN(GatedDeltaNet):
+    def _capture_forward(self, inputs, conv_state, recurrent_state):
+        """Called only after the shared capture guard validates shape, cache and flags."""
+        from mlx_lm.models.gated_delta import compute_g
+        from ...gdn_capture import _linear_gated_delta_capture
+
+        tokens = inputs.shape[1]
+        qkv = self.in_proj_qkv(inputs)
+        z = self.in_proj_z(inputs).reshape(1, tokens, self.num_v_heads, self.head_v_dim)
+        b, a = self.in_proj_b(inputs), self.in_proj_a(inputs)
+        q, k, v, conv_states = preprocess(self, qkv, conv_state, capture=True)
+        if tokens == 1:
+            out, state = gated_delta_update(
+                q, k, v, a, b, self.A_log, self.dt_bias, recurrent_state, None, use_kernel=True)
+            states = state[:, None]
+        else:
+            out, states = _linear_gated_delta_capture(
+                q, k, v, compute_g(self.A_log, a, self.dt_bias), mx.sigmoid(b), recurrent_state)
+        out = self.out_proj(self.norm(out, z).reshape(1, tokens, -1))
+        return out, conv_states, states
+
     def __call__(self, inputs, mask=None, cache=None):
         if (self.training or inputs.shape[:2] != (1, 1) or mask is not None
                 or self.sharding_group is not None or type(cache) not in (ArraysCache, FixedArraysCache)

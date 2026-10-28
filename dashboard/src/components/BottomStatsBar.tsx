@@ -18,20 +18,20 @@ export function BottomStatsBar() {
   return (
     <div className="px-4 lg:px-6 py-2 flex items-center justify-between gap-4 text-xs">
       <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-[var(--text-muted)] min-w-0">
-        <Item label="tok" value={fmtNumber(completionTokens)} />
-        <Item label="ttft" value={fmtSeconds(ttftS)} />
-        <Item label="prompt eval" value={fmtSeconds(promptEvalS)} />
-        <Item label="decode" value={fmtSeconds(decodeElapsedS)} />
+        <Item label="输出 token" value={fmtNumber(completionTokens)} />
+        <Item label="首 token 延迟" value={fmtSeconds(ttftS)} />
+        <Item label="预填充耗时" value={fmtSeconds(promptEvalS)} />
+        <Item label="生成耗时" value={fmtSeconds(decodeElapsedS)} />
         <Item
-          label={isLive ? "tok/s live" : "tok/s"}
+          label={isLive ? "实时 token/s" : "tok/s"}
           value={fmtTokS(decodeTokS)}
           highlight={isLive}
         />
-        <Item label="req tok/s" value={fmtTokS(requestTokS)} />
-        <Item label="lifetime req" value={fmtNumber(totalRequests)} />
+        <Item label="请求平均 token/s" value={fmtTokS(requestTokS)} />
+        <Item label="累计请求" value={fmtNumber(totalRequests)} />
       </div>
       <div className="text-[10px] uppercase tracking-widest text-[var(--text-muted)] hidden sm:block">
-        MTPLX live
+        MTPLX 实时监控
       </div>
     </div>
   );

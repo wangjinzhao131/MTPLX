@@ -175,3 +175,27 @@ def test_ar_final_state_control():
     )
     gap, _origin, safe = _gap(PROMPT, out)
     assert safe and gap == 0
+
+
+@pytest.mark.parametrize("mode", ["ar", "mtp"])
+def test_final_state_carries_prompt_checkpoints_without_a_bank_donor(monkeypatch, mode):
+    import mtplx.generation as generation
+
+    restore = generation.restore_or_prefill_prompt_state
+    boundaries = [(4, object(), None)]
+
+    def prefill(*args, **kwargs):
+        prompt = restore(*args, **kwargs)
+        prompt.gdn_boundaries = boundaries
+        return prompt
+
+    monkeypatch.setattr(generation, "restore_or_prefill_prompt_state", prefill)
+    generate = generate_ar if mode == "ar" else generate_mtpk
+    out = generate(
+        _runtime(_ScriptedModel(len(PROMPT) + 3, False)), PROMPT,
+        max_tokens=8, sampler=GREEDY, stop_token_ids={STOP},
+        capture_final_state=True,
+        **({"speculative_depth": 1} if mode == "mtp" else {}),
+    )
+    assert out.final_state is not None and out.final_state.safe_to_commit
+    assert out.final_state.gdn_boundaries == boundaries

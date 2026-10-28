@@ -3,14 +3,17 @@
 from __future__ import annotations
 
 import time
+import weakref
 from dataclasses import dataclass, field
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Callable
 
 import mlx.core as mx
 import numpy as np
 
 from mtplx.cache_state import CacheSnapshot
+from mtplx.checkpoint_anchors import AnchorPlan, retain_checkpoints
 
 
 _MLX_TO_NUMPY_DTYPE: dict[str, Any] = {
@@ -73,6 +76,7 @@ class DecodedPayload:
     # these are strictly the lengths represented by the decoded snapshots.
     cache_snapshot_prefix_len: int | None = None
     mtp_history_snapshot_prefix_len: int | None = None
+    explicit_cache_boundary: int | None = None
 
 
 class ColdEncodeInterrupted(RuntimeError):
@@ -161,6 +165,7 @@ class TreeCodec:
         unit_bytes: int | None = None,
         on_unit: Callable[[str, float, int], None] | None = None,
         reuse: dict[tuple, dict[str, Any]] | None = None,
+        resume: dict | None = None,
     ) -> None:
         self._next_tensor_id = 0
         # Incremental encode (opt-in): None keeps the legacy full capture.
@@ -169,6 +174,9 @@ class TreeCodec:
         # blocks are referenced instead of evaluated, copied and hashed,
         # and every fingerprinted name is recorded for the next memo.
         self.reuse = reuse
+        # Same immutable snapshot, across owner-thread yields; no tensor owners.
+        self.resume = resume
+        self.resume_sources: dict[str, tuple] = {}
         self.reused: dict[str, dict[str, Any]] = {}
         self.fingerprints: dict[str, tuple] = {}
         self.tensors: dict[str, bytes] = {}
@@ -232,6 +240,18 @@ class TreeCodec:
         if interrupted:
             raise ColdEncodeInterrupted()
 
+    def _resume_blob(self, name: str, value: Any, start: int, end: int) -> dict | None:
+        if self.resume is None:
+            return None
+        self._check_abort()
+        key = (id(value), start, end)
+        self.resume_sources[name] = (key, weakref.ref(value))
+        prior = self.resume.get(key)
+        if prior is not None and prior[0]() is value:
+            self.reused[name] = dict(prior[1])
+            return prior[1]
+        return None
+
     def encode(self, value: Any) -> Any:
         if value is None:
             return {"kind": "none"}
@@ -274,6 +294,10 @@ class TreeCodec:
             return self._encode_tensor_blocks(value, dtype=dtype, shape=shape)
         name = f"tensor_{self._next_tensor_id:08d}"
         self._next_tensor_id += 1
+        resumed = self._resume_blob(name, value, -1, -1)
+        if resumed is not None:
+            return {"kind": "tensor", "name": name, "dtype": dtype,
+                    "shape": shape, "nbytes": int(resumed["nbytes"])}
         if (
             self.reuse is not None
             and int(getattr(value, "nbytes", 0) or 0)
@@ -354,6 +378,13 @@ class TreeCodec:
             chunk = value[tuple(slices)]
             name = f"tensor_{self._next_tensor_id:08d}"
             self._next_tensor_id += 1
+            resumed = self._resume_blob(name, value, start, end)
+            if resumed is not None:
+                nbytes = int(resumed["nbytes"])
+                total += nbytes
+                blocks.append({"name": name, "start": start, "end": end,
+                               "shape": list(chunk.shape), "nbytes": nbytes})
+                continue
             block_index = start // self.block_size
             if block_fps is not None and block_index < len(block_fps):
                 chunk_shape = [int(dim) for dim in chunk.shape]
@@ -434,11 +465,12 @@ def build_payload_spec(
     mtp_history_snapshot: CacheSnapshot | None,
     gdn_boundaries: tuple | list | None = None,
     has_recurrent: bool | None = None,
+    explicit_cache_boundary: int | None = None,
 ) -> dict[str, Any]:
     """The payload spec structure, shared by the staged and streaming
     encoders (cold_tier.put_entry vs cold_tier.spill_entry) so the two can
     never drift into incompatible on-disk formats."""
-    return {
+    spec = {
         "cache_snapshot": {
             "states": codec.encode(cache_snapshot.states),
             "meta_states": codec.encode(cache_snapshot.meta_states),
@@ -472,6 +504,10 @@ def build_payload_spec(
             else bool(gdn_boundaries)
         ),
     }
+    spec["explicit_cache_boundary"] = _payload_explicit_cache_boundary(
+        {**spec, "explicit_cache_boundary": explicit_cache_boundary}
+    )
+    return spec
 
 
 def encode_payload(
@@ -482,6 +518,7 @@ def encode_payload(
     mtp_history_snapshot: CacheSnapshot | None,
     gdn_boundaries: tuple | list | None = None,
     has_recurrent: bool | None = None,
+    explicit_cache_boundary: int | None = None,
     block_size: int = 256,
     should_abort: Callable[[], bool] | None = None,
     unit_bytes: int | None = None,
@@ -503,6 +540,7 @@ def encode_payload(
         mtp_history_snapshot=mtp_history_snapshot,
         gdn_boundaries=gdn_boundaries,
         has_recurrent=has_recurrent,
+        explicit_cache_boundary=explicit_cache_boundary,
     )
     return EncodedPayload(
         spec=spec,
@@ -544,6 +582,7 @@ def decode_payload(
         mtp_history_snapshot=mtp_history_snapshot,
         gdn_boundaries=gdn_boundaries,
         has_recurrent=bool(spec.get("has_recurrent", False)),
+        explicit_cache_boundary=_payload_explicit_cache_boundary(spec),
     )
     _eval_decoded_arrays(decoded)
     return decoded
@@ -646,6 +685,9 @@ def decode_payload_prefix(
         has_recurrent=bool(spec.get("has_recurrent", False)),
         cache_snapshot_prefix_len=cache_prefix_len,
         mtp_history_snapshot_prefix_len=mtp_prefix_len,
+        explicit_cache_boundary=_payload_explicit_cache_boundary(
+            spec, frontier=cache_prefix_len
+        ),
     )
     _eval_decoded_arrays(decoded)
     return decoded
@@ -692,6 +734,8 @@ def decode_gdn_boundaries(
     read_tensor: Callable[[str], bytes],
     *,
     should_abort: Callable[[], bool] | None = None,
+    plan: AnchorPlan | None = None,
+    existing_records: tuple | list = (),
 ) -> tuple:
     """Decode only the interior recurrent boundaries from a payload spec.
 
@@ -716,10 +760,27 @@ def decode_gdn_boundaries(
         except Exception:
             return False
 
+    records = {int(r["tokens"]): r for r in spec.get("gdn_boundaries") or []}
+    existing = {int(r[0]): r for r in existing_records}
+    positions = list(records)
+    if plan is not None:
+        # Select from metadata before reading blobs: a previous run's saved
+        # checkpoint set can exceed this run's memory budget.
+        priced = [
+            (position, SimpleNamespace(nbytes=_encoded_tree_nbytes(record)), None)
+            for position, record in records.items()
+        ]
+        positions = [
+            int(r[0]) for r in retain_checkpoints([*priced, *existing.values()], plan)
+        ]
     boundaries = []
-    for record in spec.get("gdn_boundaries") or []:
+    for position in positions:
         if interrupted():
             raise ColdEncodeInterrupted()
+        if position in existing:
+            boundaries.append(existing[position])
+            continue
+        record = records[position]
         decoded = (
             int(record["tokens"]),
             CacheSnapshot(
@@ -734,6 +795,17 @@ def decode_gdn_boundaries(
             mx.eval(*arrays)
         boundaries.append(decoded)
     return tuple(boundaries)
+
+
+def _encoded_tree_nbytes(value: Any) -> int:
+    if isinstance(value, dict):
+        if value.get("kind") in {"tensor", "tensor_blocks"}:
+            # tensor_blocks.nbytes already includes its child blocks.
+            return max(0, int(value["nbytes"]))
+        return sum(_encoded_tree_nbytes(item) for item in value.values())
+    if isinstance(value, (list, tuple)):
+        return sum(_encoded_tree_nbytes(item) for item in value)
+    return 0
 
 
 def _gdn_boundary_spec_at_or_below(
@@ -751,6 +823,19 @@ def _gdn_boundary_spec_at_or_below(
         if 0 < tokens <= limit and (best is None or tokens > int(best["tokens"])):
             best = record
     return best
+
+
+def _payload_explicit_cache_boundary(
+    spec: dict[str, Any], *, frontier: int | None = None
+) -> int | None:
+    position = spec.get("explicit_cache_boundary")
+    if type(position) is not int or position <= 0:
+        return None
+    if frontier is not None and position > frontier:
+        return None
+    return position if any(
+        record.get("tokens") == position for record in spec.get("gdn_boundaries") or []
+    ) else None
 
 
 def payload_supports_prefix_decode(spec: dict[str, Any]) -> bool:
@@ -874,16 +959,102 @@ def _decode_tree_prefix(
             for item in spec.get("items") or []
         ]
     if kind == "dict":
+        fields = {
+            key.get("value"): value
+            for key, value in spec.get("items") or []
+            if isinstance(key, dict)
+            and key.get("kind") == "str"
+            and isinstance(key.get("value"), str)
+        }
+        if fields.get("kind") == {"kind": "str", "value": "mtplx_block_kv_v1"}:
+            if len(fields) != len(spec["items"]):
+                raise ValueError("invalid block KV snapshot fields")
+            return _decode_block_kv_prefix(fields, read_tensor, prefix_len=prefix_len)
         return {
             _decode_tree_prefix(key, read_tensor, prefix_len=prefix_len):
             _decode_tree_prefix(value, read_tensor, prefix_len=prefix_len)
             for key, value in spec.get("items") or []
         }
+    if kind == "tensor":
+        value = decode_tree(spec, read_tensor)
+        if prefix_len is not None and value.ndim >= 3:
+            slices = [slice(None)] * value.ndim
+            slices[2] = slice(0, max(0, int(prefix_len)))
+            value = value[tuple(slices)]
+        return value
     if kind == "tensor_blocks":
         return _decode_tensor_blocks(
             spec, read_tensor, prefix_len=prefix_len
         )
     return decode_tree(spec, read_tensor)
+
+
+def _decode_block_kv_prefix(
+    fields: dict[str, Any],
+    read_tensor: Callable[[str], bytes],
+    *,
+    prefix_len: int | None,
+) -> dict[str, Any]:
+    if set(fields) != {"kind", "block_size", "offset", "keys", "values"}:
+        raise ValueError("invalid block KV snapshot fields")
+    for name in ("block_size", "offset"):
+        field = fields[name]
+        if (
+            not isinstance(field, dict)
+            or field.get("kind") != "int"
+            or type(field.get("value")) is not int
+        ):
+            raise ValueError(f"invalid block KV snapshot {name}")
+    block_size = fields["block_size"]["value"]
+    offset = fields["offset"]["value"]
+    if block_size <= 0 or offset < 0:
+        raise ValueError("invalid block KV snapshot geometry")
+    count = (offset + block_size - 1) // block_size
+    groups = []
+    for name in ("keys", "values"):
+        sequence = fields[name]
+        if (
+            not isinstance(sequence, dict)
+            or sequence.get("kind") not in {"tuple", "list"}
+            or not isinstance(sequence.get("items"), list)
+        ):
+            raise ValueError("invalid block KV snapshot block sequence")
+        groups.append(sequence["items"])
+    if any(len(blocks) != count for blocks in groups):
+        raise ValueError("invalid block KV snapshot block count")
+    for blocks in groups:
+        geometry = None
+        for index, block in enumerate(blocks):
+            shape = block.get("shape") if isinstance(block, dict) else None
+            if (
+                not isinstance(shape, list)
+                or len(shape) != 4
+                or any(type(dim) is not int or dim <= 0 for dim in shape)
+                or block.get("kind") not in {"tensor", "tensor_blocks"}
+                or not isinstance(block.get("dtype"), str)
+                or block["dtype"] not in {*_MLX_TO_NUMPY_DTYPE, "bfloat16"}
+                or (block["kind"] == "tensor_blocks" and block.get("axis") != 2)
+                or not min(block_size, offset - index * block_size) <= shape[2] <= block_size
+            ):
+                raise ValueError("invalid block KV snapshot tensor shape")
+            current = (shape[0], shape[1], shape[3], block.get("dtype"))
+            if geometry is not None and current != geometry:
+                raise ValueError("inconsistent block KV snapshot tensors")
+            geometry = current
+    if any(key["shape"][:3] != value["shape"][:3] for key, value in zip(*groups)):
+        raise ValueError("mismatched block KV snapshot keys and values")
+
+    limit = offset if prefix_len is None else min(offset, max(0, prefix_len))
+    result = {"kind": "mtplx_block_kv_v1", "block_size": block_size, "offset": limit}
+    for name, blocks in zip(("keys", "values"), groups):
+        decoded = []
+        for index, block in enumerate(blocks[: (limit + block_size - 1) // block_size]):
+            # Physical blocks each begin at local token zero on disk.
+            take = min(block_size, limit - index * block_size)
+            arr = _decode_tree_prefix(block, read_tensor, prefix_len=take)
+            decoded.append(arr[..., :take, :])
+        result[name] = tuple(decoded)
+    return result
 
 
 def _decode_tensor(spec: dict[str, Any], read_tensor: Callable[[str], bytes]) -> Any:

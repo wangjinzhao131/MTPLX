@@ -64,7 +64,7 @@ export function TPSTimeSeries() {
       series: [
         {},
         {
-          label: "decode tok/s",
+          label: "生成速度（token/s）",
           stroke: "rgba(0,214,143,0.9)",
           width: 2,
           points: { show: false },
@@ -96,26 +96,26 @@ export function TPSTimeSeries() {
 
   return (
     <Card
-      title="Decode TPS (last 5 min)"
+      title="生成速度（最近 5 分钟）"
       subtitle={
         rolling
-          ? `${rolling.count} samples · p50 ${fmtTokS(rolling.p50)} · p95 ${fmtTokS(rolling.p95)}${
-              sessionFilter ? ` · filtered by ${sessionFilter}` : ""
+          ? `${rolling.count} 个样本 · p50 ${fmtTokS(rolling.p50)} · p95 ${fmtTokS(rolling.p95)}${
+              sessionFilter ? ` · 筛选会话 ${sessionFilter}` : ""
             }`
-          : "no completed requests yet"
+          : "尚无完成的请求"
       }
     >
       <div ref={wrapperRef} className="w-full" />
       {(maxPoint || minPoint) && (
         <div className="grid grid-cols-2 gap-2 mt-3 text-xs">
           <div className="rounded-md border border-[var(--border-soft)] bg-[var(--bg-elevated)] px-3 py-2 flex items-center justify-between">
-            <span className="text-[var(--text-muted)]">window max</span>
+            <span className="text-[var(--text-muted)]">窗口最高</span>
             <span className="text-[var(--accent-warm)] font-semibold tabular-nums">
               {fmtTokS(maxPoint?.tok_s ?? null)} tok/s
             </span>
           </div>
           <div className="rounded-md border border-[var(--border-soft)] bg-[var(--bg-elevated)] px-3 py-2 flex items-center justify-between">
-            <span className="text-[var(--text-muted)]">window min</span>
+            <span className="text-[var(--text-muted)]">窗口最低</span>
             <span className="text-[var(--accent-cool)] font-semibold tabular-nums">
               {fmtTokS(minPoint?.tok_s ?? null)} tok/s
             </span>

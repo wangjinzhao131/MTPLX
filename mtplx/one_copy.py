@@ -456,9 +456,11 @@ def lease_return(bank, runtime, *, restore_mode, cache, mtp_history_cache, token
         or not callable(getattr(bank, "return_lease", None))
     ):
         return None
-    from .session_bank import _one_copy_cache
+    from .session_bank import _native_lease_cache, _one_copy_cache
 
-    if not _one_copy_cache(cache):
+    if not (_one_copy_cache(cache) or (
+        getattr(source, "live_ref_only", False) and _native_lease_cache(cache)
+    )):
         return None
     return LeaseReturn(
         bank, runtime, cache=cache, mtp_history_cache=mtp_history_cache,

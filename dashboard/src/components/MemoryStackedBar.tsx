@@ -24,11 +24,11 @@ export function MemoryStackedBar() {
 
   return (
     <Card
-      title="MLX memory"
+      title="MLX 内存占用"
       subtitle={
         total > 0
-          ? `${fmtBytes(active + cache)} live · ${fmtBytes(headroom)} headroom · ${fmtBytes(total)} unified`
-          : "live MLX memory snapshot"
+          ? `${fmtBytes(active + cache)} MLX 占用 · ${fmtBytes(headroom)} MLX 之外 · ${fmtBytes(total)} 总内存`
+          : "MLX 实时内存快照"
       }
     >
       <div className="relative h-6 w-full rounded-full overflow-hidden border border-[var(--border-soft)] bg-[var(--bg-elevated)]">
@@ -57,19 +57,22 @@ export function MemoryStackedBar() {
           <div
             className="absolute top-0 bottom-0 border-l-2 border-[var(--accent-warm)]"
             style={{ left: `${peakPct}%` }}
-            title={`Peak ${fmtBytes(peak)}`}
+            title={`峰值 ${fmtBytes(peak)}`}
           />
         ) : null}
       </div>
       <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 mt-3 text-xs">
-        <Legend color="var(--accent)" label="active" value={fmtBytes(active)} />
-        <Legend color="var(--accent-cool)" label="cache" value={fmtBytes(cache)} />
-        <Legend color="var(--accent-warm)" label="peak" value={fmtBytes(peak)} />
-        <Legend color="rgba(255,255,255,0.15)" label="headroom" value={fmtBytes(headroom)} />
+        <Legend color="var(--accent)" label="正在使用" value={fmtBytes(active)} />
+        <Legend color="var(--accent-cool)" label="缓存" value={fmtBytes(cache)} />
+        <Legend color="var(--accent-warm)" label="峰值" value={fmtBytes(peak)} />
+        <Legend color="rgba(255,255,255,0.15)" label="MLX 之外" value={fmtBytes(headroom)} />
       </div>
+      <p className="text-xs text-[var(--text-muted)] mt-2">
+        “MLX 之外”包含系统、其他应用及尚未使用的内存，不等于系统可用内存。
+      </p>
       {!mem?.ok ? (
         <p className="text-xs text-[var(--text-muted)] mt-2">
-          MLX accessors unavailable: {mem?.error ?? "unknown"}
+          无法读取 MLX 内存： {mem?.error ?? "未知错误"}
         </p>
       ) : null}
     </Card>

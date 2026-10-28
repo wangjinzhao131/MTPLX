@@ -11,12 +11,12 @@ const COLORS: Record<string, string> = {
 };
 
 const LABELS: Record<string, string> = {
-  open: "live",
-  connecting: "connecting",
-  reconnecting: "reconnecting",
-  failed: "offline",
-  unauthorized: "sign-in required",
-  idle: "idle",
+  open: "实时连接",
+  connecting: "连接中",
+  reconnecting: "重新连接中",
+  failed: "已离线",
+  unauthorized: "需要登录",
+  idle: "空闲",
 };
 
 export function ConnectionDot() {

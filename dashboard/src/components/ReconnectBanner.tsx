@@ -13,8 +13,8 @@ export function ReconnectBanner() {
   }
   const message =
     connection === "failed"
-      ? "Connection to MTPLX lost. The dashboard will keep trying."
-      : "Reconnecting to MTPLX...";
+      ? "与 MTPLX 的连接已断开，面板将继续尝试重连。"
+      : "正在重新连接 MTPLX…";
   return (
     <div className="bg-amber-500/15 text-amber-300 text-xs px-4 py-1.5 text-center border-b border-amber-500/30">
       {message}

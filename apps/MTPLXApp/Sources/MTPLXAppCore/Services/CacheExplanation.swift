@@ -209,7 +209,7 @@ public enum CacheExplanation {
             return bankSentence("no_snapshot_coverage")
         case "ssd_format_mismatch", "ssd_mtp_epoch_mismatch", "legacy_ssd_cache_archived":
             return tr("The SSD copy was saved by a different MTPLX version or model setup")
-        case "ssd_payload_missing", "ssd_missing_mtp_generation_state", "ssd_missing_mtp_history":
+        case "ssd_payload_missing", "ssd_payload_missing_or_invalid", "ssd_missing_mtp_generation_state", "ssd_missing_mtp_history":
             return tr("The SSD copy was incomplete")
         // Requests the server keeps off the cache.
         case "vision_request_cache_bypass":

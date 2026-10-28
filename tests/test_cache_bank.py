@@ -505,7 +505,7 @@ def test_session_bank_cold_tier_finds_block_prefix_boundary_after_ram_clear(tmp_
 
         assert candidates
         entry, matched = candidates[0]
-        assert matched == 1024
+        assert matched == 1050
         assert entry.prefix_len == 1200
         assert getattr(entry, "cache_source") == "ssd"
         assert getattr(entry, "ssd_cache_hit") is True

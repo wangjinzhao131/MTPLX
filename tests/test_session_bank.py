@@ -372,7 +372,33 @@ def test_session_bank_block_prefix_candidates_restore_large_agent_overlap():
     assert bank.last_prefix_diagnostic["new_prefill_tokens"] == len(followup) - 1050
 
 
+def test_near_prefix_ranks_recoverable_tokens_and_prices_cold_lookup(monkeypatch):
+    bank = SessionBank(max_entries=4, max_bytes=4096, per_session_max_bytes=4096)
+    runtime = SimpleNamespace(model_path=Path("models/example"), mtp_enabled=True)
+    prompt = tuple(range(1500))
+    entries = []
+    for matched, boundary in ((1000, 512), (900, 768)):
+        entry = bank.put_snapshot(
+            runtime=runtime, token_ids=prompt[:matched] + (9000,),
+            cache_snapshot=CacheSnapshot(states=(), meta_states=()),
+            logits=None, hidden=None, session_id=str(matched), nbytes_override=128,
+        )
+        entry.has_recurrent = True
+        entry.gdn_boundaries = [(boundary, CacheSnapshot(states=(), meta_states=()), None)]
+        entries.append(entry)
+    calls = []
+    monkeypatch.setattr(bank, "_cold_near_prefix_candidate", lambda *a, **kw: calls.append(kw))
+    candidates = bank.near_prefix_candidates(prompt)
+    assert candidates[0][0] is entries[1]
+    assert calls[0]["min_useful_matched_tokens"] == 768
+    plan = bank.restore_plan(prompt)
+    assert plan["reuse_tokens"] == 768
+    assert plan["source"] is entries[1]
+    assert plan["keys"] == {entries[1].token_ids}
+
+
 # --- prefix-supersede (2026-07-04 multitask capacity fix) --------------------
+
 # One busy OpenCode conversation banked 13/16 RAM entries (20.6 of 24 GB),
 # a third of them strict prefixes of a newer entry; multitasking across
 # projects then churned every other project out of RAM. A newer entry that

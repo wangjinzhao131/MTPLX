@@ -16,25 +16,25 @@ export function MemoryTab() {
         <MemoryStackedBar />
       </div>
       <div className="col-span-12 sm:col-span-6 lg:col-span-4">
-        <Card title="Active memory" subtitle="MLX active allocation">
+        <Card title="活跃内存" subtitle="MLX 正在使用的内存">
           <BigNumber
             value={fmtBytes(mem?.active_memory_bytes ?? null)}
             tone="accent"
-            caption="live MLX accessor"
+            caption="MLX 实时读数"
           />
         </Card>
       </div>
       <div className="col-span-12 sm:col-span-6 lg:col-span-4">
-        <Card title="Cache memory" subtitle="MLX cache allocator">
+        <Card title="分配器缓存" subtitle="MLX 分配器保留的缓冲区">
           <BigNumber
             value={fmtBytes(mem?.cache_memory_bytes ?? null)}
             tone="cool"
-            caption="reusable buffer cache"
+            caption="可复用的内存缓冲区"
           />
         </Card>
       </div>
       <div className="col-span-12 sm:col-span-6 lg:col-span-4">
-        <Card title="Peak memory" subtitle="highest seen this process">
+        <Card title="峰值内存" subtitle="当前进程启动以来的最高值">
           <BigNumber
             value={fmtBytes(
               Math.max(
@@ -43,7 +43,7 @@ export function MemoryTab() {
               ) || null,
             )}
             tone="warm"
-            caption="includes last-request peak"
+            caption="包含最近请求的峰值"
           />
         </Card>
       </div>

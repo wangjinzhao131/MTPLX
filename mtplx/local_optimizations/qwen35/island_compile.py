@@ -14,6 +14,7 @@ from mlx_lm.models.qwen3_5 import Model
 from mlx_lm.models.qwen3_5_moe import Model as MoEModel
 
 from .attention_compile import _CompiledAttentionLayer
+from .head_kernel import forward as head_forward
 from .opt import _CompiledGDNLayer
 
 
@@ -199,7 +200,7 @@ def apply(model):
         text = model.language_model
         post_norm = text.model.norm(x)
         logits = (text.model.embed_tokens.as_linear(post_norm) if text.args.tie_word_embeddings
-                  else text.lm_head(post_norm))
+                  else head_forward(text.lm_head, post_norm))
         return logits, x, post_norm
 
     compiled_tail = mx.compile(tail)

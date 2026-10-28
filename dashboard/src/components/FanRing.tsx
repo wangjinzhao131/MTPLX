@@ -9,12 +9,9 @@ export function FanRingPanel() {
 
   if (!thermal || !thermal.ok || thermal.fans.length === 0) {
     return (
-      <Card title="Fan rings" subtitle="thermal polling disabled or unavailable">
+      <Card title="风扇转速" subtitle="风扇采样未开启或不可用">
         <p className="text-sm text-[var(--text-muted)]">
-          Pass <code>--enable-thermal-poll</code> when starting the MTPLX
-          server to populate live fan RPMs. The poll uses
-          <code> thermalforge status</code> at 1 Hz and is off by default to
-          keep the hot path clean.
+          启动 MTPLX 时添加 <code>--enable-thermal-poll</code> 可查看实时转速。通过 <code>thermalforge status</code> 每秒采样一次，默认关闭以减少运行开销。
         </p>
       </Card>
     );
@@ -22,8 +19,8 @@ export function FanRingPanel() {
 
   return (
     <Card
-      title="Fan rings"
-      subtitle={`min ${fmtNumber(thermal.min_rpm)} RPM · max ${fmtNumber(thermal.max_rpm)} RPM`}
+      title="风扇转速"
+      subtitle={`最低 ${fmtNumber(thermal.min_rpm)} RPM · 最高 ${fmtNumber(thermal.max_rpm)} RPM`}
     >
       <div className="grid grid-cols-2 gap-4">
         {thermal.fans.map((fan, idx) => (
@@ -107,9 +104,9 @@ function FanRing({ index, fan }: { index: number; fan: ThermalFan }) {
         </div>
       </div>
       <div className="mt-2 text-xs text-[var(--text-muted)] text-center">
-        F{index} · {mode}{" "}
+        F{index} · {mode === "auto" ? "自动" : mode === "manual" ? "手动" : mode}{" "}
         <span className="text-[var(--text-primary)]">
-          / {fmtNumber(capacity)} max
+          / {fmtNumber(capacity)} 最高
         </span>
       </div>
     </div>

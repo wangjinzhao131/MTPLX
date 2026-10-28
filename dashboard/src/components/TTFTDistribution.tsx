@@ -41,11 +41,11 @@ export function TTFTDistribution() {
 
   return (
     <Card
-      title="TTFT distribution"
+      title="首 token 延迟分布（TTFT）"
       subtitle={
         hasData
           ? `p50 ${fmtSeconds(p50)} · p95 ${fmtSeconds(p95)} · n=${values.length}`
-          : "no TTFT samples yet"
+          : "暂无首 token 延迟样本"
       }
     >
       <div className="h-[200px]">
@@ -68,7 +68,7 @@ export function TTFTDistribution() {
           </ResponsiveContainer>
         ) : (
           <div className="h-full grid place-items-center text-[var(--text-muted)] text-sm">
-            Generate a few requests to populate TTFT.
+            完成请求后，将显示首 token 延迟分布。
           </div>
         )}
       </div>

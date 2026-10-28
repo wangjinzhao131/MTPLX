@@ -404,7 +404,8 @@ def test_a_session_found_by_prompt_inference_keeps_the_frame_after_the_commit(
     state = _fake_streaming_session_state()
 
     with TestClient(create_app(state)) as client:
-        response = _post(client, None, TURN1, stream=True)
+        # Exercise inferred caching, beyond the short stateless bypass.
+        response = _post(client, None, [{"role": "user", "content": "Say OK. " * 80}], stream=True)
 
     assert response.status_code == 200
     snapshot = _final_stats(response.text)["session_postcommit_snapshot"]

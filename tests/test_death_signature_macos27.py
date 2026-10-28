@@ -672,8 +672,68 @@ def test_a_mac_still_short_after_the_shed_is_refused_with_its_receipt(monkeypatc
     assert shed["pool_bytes"] == GIB
     assert shed["released_bytes"] >= 3 * GIB
     assert manager.bank.has_session_entries("generating")
-    # One shed per request: the next check does not release again.
+    # A refused request stays refused without another release.
     assert guard() is True
+
+
+@pytest.mark.parametrize("outcome", ["recovered", "still_short", "empty", "clear_error", "engine_limit"])
+def test_rebuilt_pool_is_reclaimed_without_another_session_sweep(monkeypatch, outcome):
+    from unittest.mock import Mock
+
+    import mlx.core as mx
+
+    def read(bank_bytes, pool_bytes, t):
+        return _supply_reading(3 * GIB + 12 * GIB - bank_bytes, t=t)
+
+    guard, manager, generating = _shed_guard(monkeypatch, read, pool_bytes=GIB)
+    try:
+        assert guard() is False
+        assert guard.shed["released_bytes"] > 0
+        held = manager.bank.total_nbytes
+        release = Mock(wraps=manager.release_idle_sessions)
+        monkeypatch.setattr(manager, "release_idle_sessions", release)
+        guard.own_session_shed = Mock()
+        pool = {"bytes": 0 if outcome == "empty" else 4 * GIB}
+
+        def clear():
+            if outcome == "clear_error":
+                raise RuntimeError("cache clear failed")
+            pool["bytes"] = 0
+
+        clear_spy = Mock(side_effect=clear)
+        monkeypatch.setattr(mx, "clear_cache", clear_spy)
+        monkeypatch.setattr(srv, "_mlx_memory_stats_live", lambda: {
+            "ok": True, "active_memory_bytes": 80 * GIB,
+            "cache_memory_bytes": pool["bytes"],
+        })
+        monkeypatch.setattr(srv, "_read_system_memory", lambda: _supply_reading(
+            20 * GIB if pool["bytes"] == 0 and outcome in {"recovered", "engine_limit"} else 2 * GIB,
+            free=8 * GIB if pool["bytes"] == 0 and outcome == "recovered" else None,
+            t=100.0,
+        ))
+        if outcome == "engine_limit":
+            guard.limit = 80 * GIB
+
+        assert guard() is (outcome != "recovered")
+        assert clear_spy.call_count == (0 if outcome == "empty" else 1)
+        release.assert_not_called()
+        guard.own_session_shed.assert_not_called()
+        assert manager.bank.total_nbytes == held
+        if outcome != "empty":
+            assert guard.shed["pool_only"] is True
+            assert guard.shed["pool_bytes"] == 4 * GIB
+            assert guard.shed["released_bytes"] == 0
+            assert guard.shed["request_continued"] is (outcome == "recovered")
+        if outcome == "clear_error":
+            assert "cache clear failed" in guard.shed["pool_error"]
+        if outcome != "recovered":
+            assert guard.tripped["reason"] == (
+                "engine_limit" if outcome == "engine_limit" else "under_abort_floor"
+            )
+            assert guard() is True
+            assert clear_spy.call_count == (0 if outcome == "empty" else 1)
+    finally:
+        generating.end_generation()
 
 
 def test_starved_free_pages_that_recover_after_the_shed_let_the_request_go_on(

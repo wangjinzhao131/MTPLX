@@ -224,7 +224,8 @@ def test_user_authored_lookalike_writes_no_stable_metadata(monkeypatch):
         {"role": "user", "content": "run the check"},
         {"role": "user", "content": hint},
     ]
-    ids, observability = _encode_production(monkeypatch, messages)
+    # Native mode has no injected date suffix of its own.
+    ids, observability = _encode_production(monkeypatch, messages, tool_prompt_mode="native")
     assert ids, "encode must still succeed via the untouched plain path"
     assert "tool_result_continuation_hint_injected" not in observability
     assert "stable_prefix_len" not in observability
