@@ -4,6 +4,8 @@ import { Card } from "./Card";
 import { useRecentRequests } from "../hooks/usePolling";
 import { fmtNumber, fmtSeconds, fmtTokS, relativeTime, truncateMiddle } from "../lib/utils";
 import { useDashboardStore, useFilteredRecent } from "../state/store";
+import { cancellationOf } from "../lib/requestCancel";
+import { requestWait } from "../lib/requestWait";
 import type { MetricsLatest } from "../lib/types";
 
 export function RequestLogTable() {
@@ -48,6 +50,7 @@ export function RequestLogTable() {
                 <Th align="right">输出</Th>
                 <Th align="right">tok/s</Th>
                 <Th align="right">首 token 延迟</Th>
+                <Th align="right">等待</Th>
                 <Th align="right">验证次数</Th>
                 <Th>缓存</Th>
                 <Th align="right">时间</Th>
@@ -121,7 +124,7 @@ function Td({
   );
 }
 
-function Row({
+export function Row({
   row,
   isOpen,
   onToggle,
@@ -131,12 +134,30 @@ function Row({
   onToggle: () => void;
 }) {
   const sessionId = row.session_id ?? "—";
-  const cacheBadge = row.session_cache_hit
-    ? { label: "命中", color: "text-[var(--accent)] bg-[var(--accent)]/10" }
+  const cancellation = cancellationOf(row);
+  const cacheBadge = cancellation
+    ? {
+        label: cancellation.label,
+        color: "text-[var(--text-muted)] bg-[var(--text-muted)]/10",
+        tooltip: cancellation.tooltip,
+      }
+    : row.session_cache_hit
+    ? {
+        label: "命中",
+        color: "text-[var(--accent)] bg-[var(--accent)]/10",
+        tooltip: undefined,
+      }
     : {
         label: (row.cache_miss_reason ?? "未命中").toUpperCase(),
         color: "text-[var(--accent-warm)] bg-[var(--accent-warm)]/10",
+        tooltip: undefined,
       };
+  const wait = requestWait(row);
+  const waitTitle = wait
+    ? wait.parts.length > 0
+      ? wait.parts.map((part) => `${part.label}：${fmtSeconds(part.seconds)}`).join("\n")
+      : "开始处理前没有等待"
+    : undefined;
   return (
     <>
       <tr className="border-t border-[var(--border-soft)] hover:bg-[var(--bg-elevated)]/60">
@@ -160,13 +181,22 @@ function Row({
           {fmtTokS(row.decode_tok_s)}
         </Td>
         <Td align="right">{fmtSeconds(row.ttft_s)}</Td>
+        <Td align="right">
+          <span title={waitTitle}>{fmtSeconds(wait?.total_s)}</span>
+        </Td>
         <Td align="right">{fmtNumber(row.verify_calls)}</Td>
         <Td>
           <span
+            title={cacheBadge.tooltip}
             className={`px-2 py-0.5 rounded-full text-[10px] uppercase tracking-wider ${cacheBadge.color}`}
           >
             {cacheBadge.label}
           </span>
+          {cancellation?.cacheHint ? (
+            <span className="ml-2 text-[10px] text-[var(--text-muted)]">
+              {cancellation.cacheHint}
+            </span>
+          ) : null}
         </Td>
         <Td align="right" highlight={false}>
           <span className="text-[var(--text-muted)] text-xs">
@@ -176,7 +206,7 @@ function Row({
       </tr>
       {isOpen ? (
         <tr className="bg-[var(--bg-elevated)]/40">
-          <td colSpan={10} className="px-3 py-3">
+          <td colSpan={11} className="px-3 py-3">
             <pre className="text-[11px] leading-relaxed text-[var(--text-muted)] overflow-x-auto max-h-[260px]">
               {JSON.stringify(row, null, 2)}
             </pre>

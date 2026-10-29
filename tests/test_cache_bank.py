@@ -379,6 +379,114 @@ def test_session_bank_restores_exact_prefix_from_ssd_after_ram_clear(tmp_path):
         cold.close()
 
 
+def test_session_bank_ssd_exact_restore_builds_caches_with_caller_factories(tmp_path):
+    # generation passes its contiguous prefill-layout factories to restore().
+    # The exact-prefix SSD lane must build with them, as the RAM clone lane
+    # does, instead of runtime.make_cache(): under turbo that is the paged
+    # decode layout, and an ssd_clone that used it ran suffix prefill at
+    # 27-46 tok/s and decode at about half speed, with compiled verify
+    # falling back on every call.
+    cold = SessionBankColdTier(
+        base_dir=tmp_path / "session-bank",
+        mode="on",
+        min_prefix_tokens=2,
+    )
+    try:
+        runtime = FakeRuntime()
+        bank = SessionBank(
+            max_entries=1,
+            max_bytes=1024,
+            per_session_max_bytes=1024,
+            cold_tier=cold,
+        )
+        bank.put_snapshot(
+            runtime=runtime,
+            token_ids=[1, 2, 3],
+            cache_snapshot=CacheSnapshot(states=(), meta_states=()),
+            logits=None,
+            hidden=None,
+            template_hash="template-a",
+            policy_fingerprint="policy-a",
+            mtp_history_policy="committed",
+            mtp_history_snapshot=CacheSnapshot(states=(), meta_states=()),
+            snapshot_epoch=3,
+            mtp_snapshot_epoch=3,
+            nbytes_override=128,
+        )
+        assert cold.flush(timeout_s=5.0) is True
+        bank.clear()
+
+        prefill_layout_cache = ["prefill-layout-trunk"]
+        prefill_layout_mtp_cache = ["prefill-layout-mtp"]
+        built: list[str] = []
+
+        def cache_factory():
+            built.append("trunk")
+            return prefill_layout_cache
+
+        def mtp_cache_factory():
+            built.append("mtp")
+            return prefill_layout_mtp_cache
+
+        restored = bank.restore(
+            runtime,
+            [1, 2, 3, 4, 5],
+            template_hash="template-a",
+            policy_fingerprint="policy-a",
+            mtp_history_policy="committed",
+            cache_factory=cache_factory,
+            mtp_cache_factory=mtp_cache_factory,
+        )
+
+        assert restored is not None
+        assert restored.cache_source == "ssd"
+        assert restored.restore_mode == "ssd_clone"
+        assert restored.cache is prefill_layout_cache
+        assert restored.mtp_history_cache is prefill_layout_mtp_cache
+        assert built == ["trunk", "mtp"]
+    finally:
+        cold.close()
+
+
+@pytest.mark.parametrize("caller_factories", [False, True])
+def test_ssd_exact_restore_preserves_caller_cache_layout_metadata(tmp_path, caller_factories):
+    class Layer:
+        def __init__(self):
+            self.state = ()
+            self.meta_state = ("prefill-layout",)
+
+    class Runtime(FakeRuntime):
+        def make_cache(self):
+            return [Layer()]
+
+        def make_mtp_cache(self):
+            return [Layer()]
+
+    cold = SessionBankColdTier(base_dir=tmp_path / "bank", mode="on", min_prefix_tokens=1)
+    try:
+        runtime = Runtime()
+        bank = SessionBank(cold_tier=cold)
+        snapshot = CacheSnapshot(states=((1, 2, 3),), meta_states=(("decode-layout",),))
+        bank.put_snapshot(
+            runtime=runtime, token_ids=[1, 2, 3], cache_snapshot=snapshot,
+            mtp_history_snapshot=snapshot, mtp_history_policy="committed",
+            snapshot_epoch=3, mtp_snapshot_epoch=3, nbytes_override=128,
+        )
+        assert cold.flush(timeout_s=5)
+        bank.clear()
+        factories = dict(cache_factory=runtime.make_cache, mtp_cache_factory=runtime.make_mtp_cache)
+        restored = bank.restore(
+            runtime, [1, 2, 3, 4], mtp_history_policy="committed",
+            **(factories if caller_factories else {}),
+        )
+        assert restored is not None
+        for cache in (restored.cache, restored.mtp_history_cache):
+            assert cache[0].state == (1, 2, 3)
+            assert cache[0].meta_state == (("prefill-layout",) if caller_factories else ("decode-layout",))
+    finally:
+        cold.close()
+
+
 def test_session_bank_ssd_restore_relinks_same_prefix_to_new_session(tmp_path):
     cold = SessionBankColdTier(
         base_dir=tmp_path / "session-bank",

@@ -1,8 +1,18 @@
 import { useEffect, useRef, useState } from "react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
-import { Copy, Trash } from "lucide-react";
+import { Copy, Search, Trash } from "lucide-react";
+import { useLaunchInfo } from "../hooks/usePolling";
 import { api } from "../lib/api";
-import type { MutableSettings } from "../lib/types";
+import {
+  REDACTED,
+  SOURCE_HINTS,
+  SOURCE_LABELS,
+  buildRestartCommand,
+  commandHasRedactions,
+  filterEnvRows,
+  launchFlags,
+} from "../lib/launchInfo";
+import type { LaunchEnvRow, LaunchEnvSource, LaunchInfo, MutableSettings } from "../lib/types";
 import { Card } from "./Card";
 import { useDashboardStore } from "../state/store";
 
@@ -24,17 +34,39 @@ const DEBOUNCE_MS = 250;
 const CHANGED_ON_SERVER_HINT_MS = 6000;
 
 export function ControlsSidebar() {
+  const launch = useLaunchInfo();
+  const info = launch.data?.ok ? launch.data : null;
+  const unavailable = launch.isError || (launch.data !== undefined && !launch.data.ok);
   return (
     <div className="grid grid-cols-12 gap-4">
       <div className="col-span-12 lg:col-span-7">
+        <SectionHeading title="即时生效" caption="修改将应用于下一次请求。" />
         <DefaultsCard />
       </div>
       <div className="col-span-12 lg:col-span-5">
-        <RestartRequiredCard />
+        <SectionHeading title="重启后生效" caption="只读：服务当前的启动设置。" />
+        <FixedSettingsCard info={info} unavailable={unavailable} />
+        <div className="mt-4">
+          <RestartCommandCard info={info} unavailable={unavailable} />
+        </div>
         <div className="mt-4">
           <AdminActions />
         </div>
       </div>
+      {info?.env ? (
+        <div className="col-span-12">
+          <ServerParametersCard rows={info.env} />
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+function SectionHeading({ title, caption }: { title: string; caption: string }) {
+  return (
+    <div className="mb-2 px-1 flex items-baseline justify-between gap-3">
+      <h2 className="text-[10px] uppercase tracking-widest text-[var(--text-muted)]">{title}</h2>
+      <span className="text-xs text-[var(--text-muted)]">{caption}</span>
     </div>
   );
 }
@@ -351,38 +383,230 @@ function SelectField({
   );
 }
 
-function RestartRequiredCard() {
-  const modelId = useDashboardStore((s) => s.modelId);
-  const profileName = useDashboardStore((s) => s.profileName);
-  const restartCommand = `mtplx serve --model ${modelId ?? "<model>"} --profile ${profileName ?? "<profile>"} --port 8000`;
-  const copy = () => {
-    if (typeof navigator !== "undefined") {
-      navigator.clipboard?.writeText(restartCommand);
-    }
-  };
+function FixedSettingsCard({
+  info,
+  unavailable,
+}: {
+  info: LaunchInfo | null;
+  unavailable: boolean;
+}) {
+  const fixed = info?.fixed;
+  if (!fixed) {
+    return (
+      <Card title="启动设置">
+        <div className="text-sm text-[var(--text-muted)]">
+          {unavailable
+            ? "此服务未提供启动信息。"
+            : "正在加载服务启动信息…"}
+        </div>
+      </Card>
+    );
+  }
+  const flags = launchFlags(info?.argv ?? []);
+  const address = fixed.host && fixed.port ? `${fixed.host}:${fixed.port}` : "—";
   return (
-    <Card
-      title="需要重启的设置"
-      subtitle="配置方案、模型、MTP、地址和端口只能在启动时修改"
-    >
-      <p className="text-xs text-[var(--text-muted)] mb-3">
-        这些参数需要重新加载模型后生效，不能通过在线设置修改。可复制下方命令，在需要时手动重启服务。
-      </p>
-      <div className="rounded border border-[var(--border-soft)] bg-[var(--bg-elevated)] px-3 py-2 font-mono text-xs text-[var(--text-primary)] overflow-x-auto">
-        {restartCommand}
-      </div>
-      <button
-        type="button"
-        onClick={copy}
-        className="mt-3 inline-flex items-center gap-1.5 text-xs text-[var(--accent-cool)] hover:text-[var(--accent)]"
-      >
-        <Copy className="size-3.5" />
-        复制重启命令
-      </button>
+    <Card title="启动设置" subtitle={`启动方式：${info?.launcher ?? "—"}`}>
+      <dl className="grid grid-cols-[auto_1fr] gap-x-4 gap-y-2 text-sm">
+        <FixedRow label="配置方案" value={fixed.profile ?? "—"} />
+        <FixedRow label="模型" value={fixed.model_id ?? "—"} detail={fixed.model ?? undefined} />
+        <FixedRow label="地址" value={address} />
+        <FixedRow
+          label="生成模式"
+          value={`${fixed.generation_mode ?? "—"} · MTP ${fixed.load_mtp ? "已加载" : "关闭"}`}
+        />
+        <FixedRow label="API 密钥" value={fixed.api_key_required ? "需要" : "不需要"} />
+        <FixedRow
+          label="上下文窗口"
+          value={fixed.context_window ? fixed.context_window.toLocaleString() : "模型默认值"}
+        />
+      </dl>
+      {flags.length > 0 ? (
+        <div className="mt-4">
+          <div className="text-xs text-[var(--text-muted)] mb-1.5">命令行参数</div>
+          <div className="flex flex-wrap gap-1.5">
+            {flags.map(({ flag, value }, idx) => (
+              <span
+                key={`${flag}-${idx}`}
+                className="rounded border border-[var(--border-soft)] bg-[var(--bg-elevated)] px-1.5 py-0.5 font-mono text-[11px] text-[var(--text-primary)] max-w-full truncate"
+                title={value === null ? flag : `${flag} ${value}`}
+              >
+                {flag}
+                {value === null ? null : (
+                  <span className="text-[var(--text-muted)]"> {value}</span>
+                )}
+              </span>
+            ))}
+          </div>
+        </div>
+      ) : null}
     </Card>
   );
 }
 
+function FixedRow({ label, value, detail }: { label: string; value: string; detail?: string }) {
+  return (
+    <>
+      <dt className="text-xs text-[var(--text-muted)] pt-0.5">{label}</dt>
+      <dd className="min-w-0 text-[var(--text-primary)]">
+        <div className="truncate" title={value}>
+          {value}
+        </div>
+        {detail && detail !== value ? (
+          <div className="truncate font-mono text-[11px] text-[var(--text-muted)]" title={detail}>
+            {detail}
+          </div>
+        ) : null}
+      </dd>
+    </>
+  );
+}
+
+function RestartCommandCard({
+  info,
+  unavailable,
+}: {
+  info: LaunchInfo | null;
+  unavailable: boolean;
+}) {
+  const [copied, setCopied] = useState(false);
+  const restart = info?.restart;
+  const command = restart ? buildRestartCommand(restart) : null;
+  useEffect(() => {
+    if (!copied) return;
+    const handle = window.setTimeout(() => setCopied(false), 2000);
+    return () => window.clearTimeout(handle);
+  }, [copied]);
+  const copy = () => {
+    if (!command || typeof navigator === "undefined") return;
+    navigator.clipboard?.writeText(command).then(() => setCopied(true), () => undefined);
+  };
+  return (
+    <Card title="重启命令" subtitle="这些设置仅在服务重启后改变。">
+      {command && restart ? (
+        <>
+          <p className="text-xs text-[var(--text-muted)] mb-3">
+            使用当前相同的命令和启动环境重新启动服务。
+            如需更改设置，请编辑复制的命令。
+          </p>
+          <pre className="rounded border border-[var(--border-soft)] bg-[var(--bg-elevated)] px-3 py-2 font-mono text-xs text-[var(--text-primary)] overflow-x-auto max-h-[260px] whitespace-pre">
+            {command}
+          </pre>
+          {commandHasRedactions(restart) ? (
+            <p className="mt-2 text-xs text-[var(--accent-warm)]">
+              显示为 {REDACTED} 的敏感值已隐藏；运行前请补全。
+            </p>
+          ) : null}
+          <button
+            type="button"
+            onClick={copy}
+            className="mt-3 inline-flex items-center gap-1.5 text-xs text-[var(--accent-cool)] hover:text-[var(--accent)]"
+          >
+            <Copy className="size-3.5" />
+            {copied ? "已复制" : "复制重启命令"}
+          </button>
+        </>
+      ) : (
+        <div className="text-sm text-[var(--text-muted)]">
+          {unavailable
+            ? "此服务未提供启动信息。请使用最初启动服务时的命令重启。"
+            : "正在加载服务启动信息…"}
+        </div>
+      )}
+    </Card>
+  );
+}
+
+function ServerParametersCard({ rows }: { rows: LaunchEnvRow[] }) {
+  const [query, setQuery] = useState("");
+  const shown = filterEnvRows(rows, query);
+  return (
+    <Card
+      title="服务参数"
+      subtitle="服务当前使用的 MTPLX_*、MLX_* 和 PYTHONPATH，以及各值的来源"
+      action={
+        <span className="text-xs text-[var(--text-muted)] tabular-nums">
+          {shown.length === rows.length ? rows.length : `${shown.length} / ${rows.length}`}
+        </span>
+      }
+    >
+      <div className="flex flex-wrap items-center gap-3 mb-3">
+        <label className="relative flex-1 min-w-[220px] max-w-md">
+          <Search className="size-3.5 absolute left-2.5 top-1/2 -translate-y-1/2 text-[var(--text-muted)]" />
+          <input
+            type="search"
+            value={query}
+            onChange={(e) => setQuery(e.target.value)}
+            placeholder="搜索名称、值或来源"
+            aria-label="搜索服务参数"
+            className="w-full bg-[var(--bg-elevated)] border border-[var(--border-soft)] rounded pl-8 pr-2 py-1.5 text-sm text-[var(--text-primary)] placeholder:text-[var(--text-muted)]"
+          />
+        </label>
+        <div className="flex flex-wrap gap-x-4 gap-y-1 text-xs text-[var(--text-muted)]">
+          {(Object.keys(SOURCE_LABELS) as LaunchEnvSource[]).map((source) => (
+            <span key={source} title={SOURCE_HINTS[source]} className="inline-flex items-center gap-1.5">
+              <SourceBadge source={source} />
+            </span>
+          ))}
+        </div>
+      </div>
+      {shown.length === 0 ? (
+        <div className="text-sm text-[var(--text-muted)]">没有与“{query}”匹配的参数。</div>
+      ) : (
+        <div className="overflow-x-auto -mx-3 max-h-[480px] overflow-y-auto">
+          <table className="min-w-full text-sm">
+            <thead className="text-[10px] uppercase tracking-widest text-[var(--text-muted)] sticky top-0 bg-[var(--bg-card)]">
+              <tr>
+                <th className="px-3 py-2 font-medium text-left">名称</th>
+                <th className="px-3 py-2 font-medium text-left">值</th>
+                <th className="px-3 py-2 font-medium text-left">来源</th>
+              </tr>
+            </thead>
+            <tbody>
+              {shown.map((row) => (
+                <tr key={row.name} className="border-t border-[var(--border-soft)]">
+                  <td className="px-3 py-1.5 font-mono text-xs text-[var(--text-primary)] whitespace-nowrap">
+                    {row.name}
+                  </td>
+                  <td className="px-3 py-1.5 font-mono text-xs text-[var(--text-primary)] break-all">
+                    {row.value}
+                    {row.source === "both" && row.profile_value !== undefined && row.profile_value !== row.value ? (
+                      <div className="text-[11px] text-[var(--text-muted)]">
+                        配置方案指定值：{row.profile_value}
+                      </div>
+                    ) : null}
+                    {row.source === "both" && row.launch_value !== undefined && row.launch_value !== row.value ? (
+                      <div className="text-[11px] text-[var(--text-muted)]">
+                        启动值 {row.launch_value} 已被配置方案覆盖
+                      </div>
+                    ) : null}
+                  </td>
+                  <td className="px-3 py-1.5 whitespace-nowrap" title={SOURCE_HINTS[row.source]}>
+                    <SourceBadge source={row.source} />
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </Card>
+  );
+}
+
+const SOURCE_TONE: Record<LaunchEnvSource, string> = {
+  launch: "text-[var(--accent)] border-[var(--accent)]/40",
+  profile: "text-[var(--text-muted)] border-[var(--border-soft)]",
+  both: "text-[var(--accent-warm)] border-[var(--accent-warm)]/40",
+  flag: "text-[var(--accent-cool)] border-[var(--accent-cool)]/40",
+};
+
+function SourceBadge({ source }: { source: LaunchEnvSource }) {
+  return (
+    <span className={`rounded border px-1.5 py-0.5 text-[11px] ${SOURCE_TONE[source]}`}>
+      {SOURCE_LABELS[source]}
+    </span>
+  );
+}
 function AdminActions() {
   const queryClient = useQueryClient();
   const [confirming, setConfirming] = useState(false);

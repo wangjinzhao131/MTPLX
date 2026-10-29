@@ -21,6 +21,44 @@ External Hermes profile plugins and core patches are not part of this MTPLX
 repository. Private conversations, local credentials, model weights and raw
 machine-specific experiment artifacts are excluded.
 
+## Upstream fixes integrated on 2026-10-29
+
+These changes adapt the following upstream pull requests to this branch's
+native ownership, explicit checkpoints and Chinese dashboard:
+
+- [#656](https://github.com/youssofal/MTPLX/pull/656): partially decoded cache
+  snapshots skip each layer's metadata as a whole, including tuple metadata.
+- [#668](https://github.com/youssofal/MTPLX/pull/668) (also proposed in
+  [#608](https://github.com/youssofal/MTPLX/pull/608)): exact SSD restores use
+  the caller's target and MTP cache factories and preserve their layouts.
+- [#609](https://github.com/youssofal/MTPLX/pull/609): metadata-only SSD prefix
+  planning prevents a shorter RAM match from hiding a longer compatible SSD
+  entry. The local adaptation includes the decoded donor in memory admission
+  and retains RAM fallback if hydration fails. Exact token, identity, epoch and
+  recurrent-checkpoint checks still govern reuse.
+- [#652](https://github.com/youssofal/MTPLX/pull/652): cancelled requests retain
+  completed prefill cache results; unknown results remain unknown.
+- [#617](https://github.com/youssofal/MTPLX/pull/617): request details expose
+  scheduler, lock, postcommit and response-tail waits.
+- [#622](https://github.com/youssofal/MTPLX/pull/622): separate RAM and SSD
+  cache summaries, including manifest age, session and restore coverage.
+- [#623](https://github.com/youssofal/MTPLX/pull/623): settings show the real
+  launch command, effective environment and value sources. Credentials are
+  redacted; copied commands with redacted values need those values restored.
+
+SSD preference is subject to the existing memory limits. Admission includes
+the incoming donor plus a conservative copying estimate covering a failed
+SSD restore's RAM fallback. It may therefore refuse a longer SSD restore under
+low headroom. This integration does not claim a new inference speedup.
+
+The integration passed focused SSD selection/fallback, cache-layout, memory
+admission, native ownership, cancellation, launch-redaction and dashboard tests.
+The Chinese dashboard passed TypeScript and production-build checks. The local
+8008 service was restarted with unchanged launch files; the new monitoring
+endpoint and one short generation request responded successfully. The RAM/SSD
+overview and launch-settings pages were checked in a browser. No full upstream
+suite or new long-context performance benchmark was run for this integration.
+
 ## Local serving settings
 
 Install using the existing project instructions and local optimization profile

@@ -572,6 +572,7 @@ def _near_candidate_serves(
     *,
     floor: int,
     identity: dict[str, Any],
+    restore_point: int | None = None,
 ) -> bool:
     """Mirror the restore's gates for one near-prefix candidate
     (generation._restore_near_prefix_prompt_state), reading only RAM."""
@@ -598,7 +599,9 @@ def _near_candidate_serves(
         and int(entry.mtp_snapshot_epoch) != int(entry.snapshot_epoch)
     ):
         return False
-    if entry.has_recurrent and _recurrent_restore_point(entry, matched) <= int(floor):
+    if entry.has_recurrent and (
+        _recurrent_restore_point(entry, matched) if restore_point is None else restore_point
+    ) <= int(floor):
         return False
     # The restore trims the cache to one slot short of the match (the seed
     # slot); a cache that cannot reach that far fails the trim and the
@@ -2103,6 +2106,41 @@ class SessionBank:
                 best = entry
         return best
 
+    def cold_exact_prefix_plan(
+        self,
+        token_ids: list[int] | tuple[int, ...],
+        *,
+        model_path: str,
+        mtp_enabled: bool,
+        hidden_variant: str | None = None,
+        template_hash: str | None = None,
+        mtp_history_policy: str | None = None,
+        draft_head_identity: str | None = None,
+        policy_fingerprint: str | None = None,
+        required_boundary: int | None = None,
+        ssd_restore_max_bytes: int | None = None,
+    ) -> dict[str, int] | None:
+        """Longest usable SSD whole prefix, using metadata without hydration."""
+        probe = getattr(self.cold_tier, "exact_prefix_plan", None)
+        if not callable(probe):
+            return None
+        return probe(
+            token_ids,
+            model_path=model_path,
+            mtp_enabled=mtp_enabled,
+            hidden_variant=hidden_variant,
+            template_hash=template_hash,
+            mtp_history_policy=mtp_history_policy,
+            draft_head_identity=draft_head_identity,
+            policy_fingerprint=policy_fingerprint,
+            required_boundary=required_boundary,
+            ssd_restore_max_bytes=ssd_restore_max_bytes,
+        )
+
+    def cold_exact_prefix_len(self, token_ids, **identity: Any) -> int:
+        plan = self.cold_exact_prefix_plan(token_ids, **identity)
+        return int(plan["reuse_tokens"]) if plan is not None else 0
+
     def near_prefix_candidates(
         self,
         token_ids: list[int] | tuple[int, ...],
@@ -2517,6 +2555,7 @@ class SessionBank:
         cache_factory: Callable[[], list[Any]] | None = None,
         mtp_cache_factory: Callable[[], list[Any]] | None = None,
         required_boundary: int | None = None,
+        ssd_exact_plan: dict[str, Any] | None = None,
     ) -> SessionBankRestore | None:
         mode = str(mode).replace("-", "_")
         if mode == "reference_lease":
@@ -2558,8 +2597,13 @@ class SessionBank:
                 policy_fingerprint=policy_fingerprint,
                 ram_refusal=ram_refusal,
                 required_boundary=required_boundary,
+                cache_factory=cache_factory,
+                mtp_cache_factory=mtp_cache_factory,
+                ssd_exact_plan=ssd_exact_plan,
             )
 
+        if ssd_exact_plan is not None:
+            return cold_fallback()
         entry = self.longest_prefix(token_ids)
         if entry is None:
             self.last_miss_reason = (
@@ -3863,6 +3907,9 @@ class SessionBank:
         policy_fingerprint: str | None,
         ram_refusal: dict[str, Any] | None = None,
         required_boundary: int | None = None,
+        cache_factory: Callable[[], list[Any]] | None = None,
+        mtp_cache_factory: Callable[[], list[Any]] | None = None,
+        ssd_exact_plan: dict[str, Any] | None = None,
     ) -> SessionBankRestore | None:
         # ram_refusal: restore() refused this lookup's longest RAM prefix
         # (ram_miss_reason, ram_refused_prefix_len, ram_refused_session_id).
@@ -3893,6 +3940,10 @@ class SessionBank:
             draft_head_identity=draft_head_identity,
             policy_fingerprint=policy_fingerprint,
             **({"required_boundary": required_boundary} if required_boundary is not None else {}),
+            **({
+                "required_prefix_len": int(ssd_exact_plan["reuse_tokens"]),
+                "max_restore_bytes": int(ssd_exact_plan["restore_donor_nbytes"]),
+            } if ssd_exact_plan is not None else {}),
         )
         if record is None:
             # Read the miss reason through the cheap accessor: stats() is the
@@ -3973,15 +4024,24 @@ class SessionBank:
         ):
             self.last_miss_reason = "explicit_cache_boundary_missing"
             return None
-        cache = runtime.make_cache()
-        restore_cache(cache, entry.cache_snapshot)
+        cache = cache_factory() if cache_factory is not None else runtime.make_cache()
+        restore_cache(
+            cache, entry.cache_snapshot, restore_meta_state=cache_factory is None
+        )
         # Read back from disk, the entry's floor is its restored caches'.
         entry.restore_floor_tokens = _cache_restore_floor(cache)
         entry.window_nbytes = _cache_window_nbytes(cache)
         mtp_history_cache = None
         if entry.mtp_history_snapshot is not None:
-            mtp_history_cache = runtime.make_mtp_cache()
-            restore_cache(mtp_history_cache, entry.mtp_history_snapshot)
+            mtp_history_cache = (
+                mtp_cache_factory()
+                if mtp_cache_factory is not None
+                else runtime.make_mtp_cache()
+            )
+            restore_cache(
+                mtp_history_cache, entry.mtp_history_snapshot,
+                restore_meta_state=mtp_cache_factory is None,
+            )
         entry.hits += 1
         entry.last_access_s = time.time()
         self._entries[entry.token_ids] = entry
@@ -4520,8 +4580,11 @@ class SessionBank:
         draft_head_identity: str | None = None,
         policy_fingerprint: str | None = None,
         near_prefix: bool = True,
+        include_cold: bool = False,
+        required_boundary: int | None = None,
+        ssd_restore_max_bytes: int | None = None,
     ) -> dict[str, Any]:
-        """What the prompt's restore would read from RAM, by its own rules.
+        """What the prompt's restore would read, by its own rules.
 
         The restore (generation.restore_or_prefill_prompt_state) tries, in
         order: a near-prefix candidate that restores more than the exact
@@ -4534,9 +4597,11 @@ class SessionBank:
         (``_near_candidate_serves``). The entries of the lanes that would
         run and pass are returned as ``keys`` (reclamation spares every one
         of them, at most two); ``reuse_tokens`` is the most the restore reaches and
-        ``source`` the entry that reaches it. RAM only: no SSD lookup, no
-        boundary load, no diagnostic state. Identity fields left None match
-        anything, which only ever protects more.
+        ``source`` the entry that reaches it. By default, RAM only: no SSD
+        lookup, boundary load, or diagnostic state. Identity fields left None match
+        anything, which only ever protects more. With include_cold, a longer
+        usable SSD exact prefix wins; its immutable donor is billed separately
+        and RAM keys remain protected for failed-hydration fallback.
 
         Replaces a token-overlap rule that protected the entry with the
         longest block-rounded common prefix: a longer recurrent entry with
@@ -4550,6 +4615,7 @@ class SessionBank:
             "reuse_tokens": 0,
             "source": None,
             "mode": "none",
+            "restore_donor_nbytes": 0,
         }
         if not prompt_tokens:
             return plan
@@ -4573,27 +4639,65 @@ class SessionBank:
 
         exact = self.longest_prefix(tokens)
         exact_len = int(exact.prefix_len) if exact is not None else 0
+        exact_boundary_missing = (
+            required_boundary is not None and exact is not None and exact.has_recurrent
+            and 0 < required_boundary < exact_len
+            and not exact.has_recurrent_boundary(required_boundary)
+        )
+        if exact_boundary_missing:
+            exact_len = 0
         exact_serves = (
             exact is not None
             and _exact_restore_serves(exact, identity)
             and (exact_len < len(tokens) or not exact.extension_only)
+            and not exact_boundary_missing
         )
         if exact_serves:
             take(exact, exact_len, "exact")
-        if not near_prefix or len(tokens) < 2:
-            return plan
+        allow_block_prefix = True
+        if include_cold:
+            near_prefix = near_prefix and str(os.environ.get(
+                "MTPLX_SESSION_NEAR_PREFIX_RESTORE", "1"
+            )).strip().lower() not in {"0", "false", "off", "no"}
+            compact = all(part in (policy_fingerprint or "") for part in (
+                "tool_prompt_mode=compact",
+                "tool_contract=compact_tool_contract:schema_free:v1",
+                "opencode_prompt_contract=opencode_agent",
+            ))
+            allow_block_prefix = compact or (
+                block_prefix_restore_enabled()
+                and (_boundary_true_restore_enabled() or not exact_serves)
+            )
+
+        def reachable(entry: SessionBankEntry, matched: int) -> int:
+            if not entry.has_recurrent:
+                return int(matched)
+            if not include_cold:
+                return _recurrent_restore_point(entry, matched)
+            # Protection may overestimate lazy checkpoints; SSD selection
+            # must compare the actual metadata frontier without hydration.
+            positions = [int(record[0]) for record in entry.gdn_boundaries]
+            positions.extend(getattr(entry.gdn_boundary_loader, "positions", ()))
+            return max((p for p in positions if p <= matched
+                        and _restorable_boundary(entry.token_ids, p)), default=0)
+
         knobs = _near_prefix_knobs()
         matches: list[tuple[SessionBankEntry, int]] = []
-        for entry in list(self._entries.values()):
+        for entry in list(self._entries.values()) if near_prefix and len(tokens) >= 2 else ():
             candidate = _near_prefix_candidate_len(
-                entry, tokens, allow_block_prefix=True, **knobs
+                entry, tokens, allow_block_prefix=allow_block_prefix, **knobs
             )
             if candidate is not None:
+                if (
+                    required_boundary is not None and required_boundary <= candidate
+                    and entry.has_recurrent
+                    and not entry.has_recurrent_boundary(required_boundary)
+                ):
+                    candidate = int(required_boundary)
                 matches.append((entry, candidate))
         matches.sort(
             key=lambda item: (
-                _recurrent_restore_point(item[0], item[1])
-                if item[0].has_recurrent else item[1],
+                reachable(item[0], item[1]),
                 item[1], item[0].prefix_len,
             ),
             reverse=True,
@@ -4608,16 +4712,25 @@ class SessionBank:
             floors.append(0 if exact_len < len(tokens) else exact_len)
         for floor in floors:
             for entry, candidate in matches:
+                reach = reachable(entry, candidate)
                 if _near_candidate_serves(
-                    entry, candidate, floor=floor, identity=identity
+                    entry, candidate, floor=floor, identity=identity, restore_point=reach
                 ):
-                    reach = (
-                        _recurrent_restore_point(entry, candidate)
-                        if entry.has_recurrent
-                        else int(candidate)
-                    )
                     take(entry, reach, "near_prefix")
                     break
+        if (
+            include_cold and model_path is not None and mtp_enabled is not None
+            and int(plan["reuse_tokens"]) < len(tokens)
+        ):
+            cold = self.cold_exact_prefix_plan(
+                tokens, **identity, required_boundary=required_boundary,
+                ssd_restore_max_bytes=ssd_restore_max_bytes,
+            )
+            if cold is not None and int(cold["reuse_tokens"]) > int(plan["reuse_tokens"]):
+                plan.update(
+                    reuse_tokens=int(cold["reuse_tokens"]), source=None, mode="ssd_exact",
+                    restore_donor_nbytes=int(cold["decoded_nbytes"]),
+                )
         return plan
 
     def restore_source_keys(

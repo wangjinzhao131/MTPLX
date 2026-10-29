@@ -181,7 +181,7 @@ public enum CacheExplanation {
             return tr("The conversation was busy with another request")
         case "snapshot_desync":
             return tr("The saved state was out of step with the conversation and was not used")
-        case "no_snapshot_coverage", "no_gdn_boundaries":
+        case "no_snapshot_coverage", "no_gdn_boundaries", "explicit_cache_boundary_missing":
             return tr("No saved state covers this point of the conversation")
         case "oversized_snapshot_skipped":
             return tr("The conversation was too large to keep in memory")

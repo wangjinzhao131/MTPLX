@@ -6674,6 +6674,7 @@ def restore_or_prefill_prompt_state(
     stable_prefix_len: int | None = None,
     explicit_cache_boundary: int | None = None,
     capture_hidden: bool | None = None,
+    ssd_restore_max_bytes: int | None = None,
 ) -> PromptState:
     """Build the initial prompt state used by MTP-k decode.
 
@@ -6975,6 +6976,18 @@ def restore_or_prefill_prompt_state(
                     "prefill_compute_tok_s": compute_tok_s,
                     "prefill_wall_tok_s": wall_tok_s,
                     "cache_hit": bool(state.cache_hit),
+                    # The cache outcome as the request's stats will report
+                    # it, so a request cancelled during decode can still say
+                    # where its prompt came from.
+                    "cache_source": state.cache_source,
+                    "cache_miss_reason": state.cache_miss_reason,
+                    "ssd_cache_hit": bool(state.ssd_cache_hit),
+                    "ssd_cached_tokens": int(state.ssd_cached_tokens),
+                    "ssd_restore_s": float(state.ssd_restore_s),
+                    "ssd_suffix_tokens": new_tokens if state.ssd_cache_hit else 0,
+                    "session_restore_served": dict(
+                        getattr(state, "restore_served", None) or {}
+                    ),
                 }
             )
         except Exception:
@@ -7021,6 +7034,51 @@ def restore_or_prefill_prompt_state(
         ):
             exact_prefix_len = 0
 
+        ram_exact_prefix_len = exact_prefix_len
+        ssd_exact_plan = None
+        plan_restore = getattr(session_bank, "restore_plan", None)
+        if callable(plan_restore):
+            plan = plan_restore(
+                bank_match_ids,
+                model_path=str(rt.model_path), mtp_enabled=bool(rt.mtp_enabled),
+                hidden_variant=base_hidden_variant, template_hash=template_hash,
+                mtp_history_policy=mtp_history_policy,
+                draft_head_identity=draft_head_identity,
+                policy_fingerprint=policy_fingerprint,
+                include_cold=True, required_boundary=explicit_cache_boundary,
+                ssd_restore_max_bytes=ssd_restore_max_bytes,
+            )
+            if plan["mode"] == "ssd_exact":
+                ssd_exact_plan = plan
+                exact_prefix_len = int(plan["reuse_tokens"])
+
+        def try_near_prefix(floor, *, allow_block_prefix=None, lookup_limit=None):
+            return _restore_near_prefix_prompt_state(
+                rt, prompt_ids,
+                base_hidden_variant=base_hidden_variant,
+                mtp_hidden_variant=mtp_hidden_variant,
+                mtp_history_policy=mtp_history_policy,
+                session_bank=session_bank,
+                template_hash=template_hash,
+                draft_head_identity=draft_head_identity,
+                policy_fingerprint=policy_fingerprint,
+                min_restore_tokens=floor,
+                allow_block_prefix=allow_block_prefix,
+                abort_check=abort_check,
+                chunk_callback=prefill_callback,
+                chunk_started_s=prefill_started_s,
+                cache_factory=restore_cache_factory,
+                stable_prefix_len=stable_prefix_len,
+                system_prefix_len=system_prefix_len,
+                explicit_cache_boundary=explicit_cache_boundary,
+                lookup_limit=lookup_limit,
+                match_ids=bank_key_ids,
+                checkpoint_image_spans=checkpoint_image_spans,
+                vision_splice=vision_splice,
+                session_id=session_id,
+                reread=_reread,
+            )
+
         tried_larger_near_prefix = False
         # Image prompts take the near/block-prefix lanes in their content-keyed
         # view (bank_key_ids, passed as match_ids; the model still reads the
@@ -7059,37 +7117,8 @@ def restore_or_prefill_prompt_state(
             else:
                 allow_block_prefix = False
             tried_larger_near_prefix = True
-            near_prompt_state = _restore_near_prefix_prompt_state(
-                rt,
-                prompt_ids,
-                base_hidden_variant=base_hidden_variant,
-                mtp_hidden_variant=mtp_hidden_variant,
-                mtp_history_policy=mtp_history_policy,
-                session_bank=session_bank,
-                template_hash=template_hash,
-                draft_head_identity=draft_head_identity,
-                policy_fingerprint=policy_fingerprint,
-                min_restore_tokens=exact_prefix_len,
-                allow_block_prefix=allow_block_prefix,
-                abort_check=abort_check,
-                chunk_callback=prefill_callback,
-                chunk_started_s=prefill_started_s,
-                match_ids=bank_key_ids,
-                checkpoint_image_spans=checkpoint_image_spans,
-                vision_splice=vision_splice,
-                session_id=session_id,
-                cache_factory=restore_cache_factory,
-                # Tool-round prefix stability (defect A): the suffix prefill
-                # behind this lane must treat the pre-nudge stable edge as a
-                # mandatory chunk boundary so a recurrent snapshot exists
-                # exactly where the next request's history diverges from the
-                # committed stream. Lane 2 below has always forwarded this;
-                # omitting it here left the hottest tool-round path
-                # block-rounding down ~one 256-token block per round.
-                stable_prefix_len=stable_prefix_len,
-                system_prefix_len=system_prefix_len,
-                explicit_cache_boundary=explicit_cache_boundary,
-                reread=_reread,
+            near_prompt_state = try_near_prefix(
+                exact_prefix_len, allow_block_prefix=allow_block_prefix,
             )
             if near_prompt_state is not None:
                 return _emit_prefill_complete(near_prompt_state)
@@ -7099,19 +7128,33 @@ def restore_or_prefill_prompt_state(
             {"required_boundary": explicit_cache_boundary}
             if explicit_cache_boundary is not None else {}
         )
-        restored = session_bank.restore(
-            rt,
-            bank_match_ids,
-            mode=effective_restore_mode,
-            session_id=session_id,
-            hidden_variant=base_hidden_variant,
-            template_hash=template_hash,
-            mtp_history_policy=mtp_history_policy,
-            draft_head_identity=draft_head_identity,
-            policy_fingerprint=policy_fingerprint,
-            cache_factory=restore_cache_factory,
-            **required_boundary,
-        )
+
+        def restore_exact(plan=None):
+            return session_bank.restore(
+                rt,
+                bank_match_ids,
+                mode=effective_restore_mode,
+                session_id=session_id,
+                hidden_variant=base_hidden_variant,
+                template_hash=template_hash,
+                mtp_history_policy=mtp_history_policy,
+                draft_head_identity=draft_head_identity,
+                policy_fingerprint=policy_fingerprint,
+                cache_factory=restore_cache_factory,
+                **required_boundary,
+                **({"ssd_exact_plan": plan} if plan is not None else {}),
+            )
+
+        restored = restore_exact(ssd_exact_plan)
+        if ssd_exact_plan is not None and restored is None:
+            # Metadata cannot prove tensor availability; retry candidates
+            # that beat the RAM exact fallback without the failed SSD floor.
+            near_prompt_state = try_near_prefix(
+                ram_exact_prefix_len, lookup_limit=explicit_cache_boundary,
+            )
+            if near_prompt_state is not None:
+                return _emit_prefill_complete(near_prompt_state)
+            restored = restore_exact()
         restore_elapsed_s = time.perf_counter() - restore_started
         if restored is not None and (
             not _mtp_history_uses_committed_cache(mtp_history_policy)
@@ -7316,30 +7359,9 @@ def restore_or_prefill_prompt_state(
                 explicit_cache_boundary=effective_cache_boundary,
             ))
 
-        near_prompt_state = _restore_near_prefix_prompt_state(
-            rt,
-            prompt_ids,
-            base_hidden_variant=base_hidden_variant,
-            mtp_hidden_variant=mtp_hidden_variant,
-            mtp_history_policy=mtp_history_policy,
-            session_bank=session_bank,
-            template_hash=template_hash,
-            draft_head_identity=draft_head_identity,
-            policy_fingerprint=policy_fingerprint,
-            min_restore_tokens=0 if tried_larger_near_prefix else exact_prefix_len,
-            abort_check=abort_check,
-            chunk_callback=prefill_callback,
-            chunk_started_s=prefill_started_s,
-            cache_factory=restore_cache_factory,
-            stable_prefix_len=stable_prefix_len,
-            system_prefix_len=system_prefix_len,
-            explicit_cache_boundary=explicit_cache_boundary,
+        near_prompt_state = try_near_prefix(
+            0 if tried_larger_near_prefix else exact_prefix_len,
             lookup_limit=explicit_cache_boundary,
-            match_ids=bank_key_ids,
-            checkpoint_image_spans=checkpoint_image_spans,
-            vision_splice=vision_splice,
-            session_id=session_id,
-            reread=_reread,
         )
         if near_prompt_state is not None:
             return _emit_prefill_complete(near_prompt_state)
@@ -9492,6 +9514,7 @@ def generate_ar(
         abort_check=abort_check,
         capture_hidden=ar_return_hidden,
         explicit_cache_boundary=(trace_metadata or {}).get("explicit_cache_boundary"),
+        ssd_restore_max_bytes=(trace_metadata or {}).get("ssd_restore_max_bytes"),
         store_prefix_snapshot=store_prefix_snapshot,
     )
     prompt_state_total_time_s = time.perf_counter() - _prompt_state_started
@@ -11231,6 +11254,7 @@ def generate_mtpk(
             abort_check=abort_check,
             stable_prefix_len=_stable_prefix_len,
             explicit_cache_boundary=(trace_metadata or {}).get("explicit_cache_boundary"),
+            ssd_restore_max_bytes=(trace_metadata or {}).get("ssd_restore_max_bytes"),
             store_prefix_snapshot=store_prefix_snapshot,
         )
     prompt_state_total_time_s = time.perf_counter() - _prompt_state_started

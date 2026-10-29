@@ -15,6 +15,10 @@ export type MetricsLatest = {
   prompt_eval_time_s?: number | null;
   decode_elapsed_s?: number | null;
   ttft_s?: number | null;
+  // Where the time to first token went, span by span (request_spans.py).
+  ttft_spans?: {
+    exclusive_s?: Record<string, number | null> | null;
+  } | null;
   // ---- rates ----
   tok_s?: number | null;
   decode_tok_s?: number | null;
@@ -57,9 +61,17 @@ export type MetricsLatest = {
   repair_time_by_reject_depth_s?: Record<string, number> | null;
   // ---- when the request finished (wall clock, seconds) ----
   completed_at_s?: number | null;
+  // ---- cancellation (a request that did not run to the end) ----
+  request_cancelled?: boolean | null;
+  cancellation_reason?: string | null;
+  cancellation_elapsed_s?: number | null;
+  stream_cancelled_by_client?: boolean | null;
   // ---- cache ----
+  // null on a cancelled request whose prefill had not finished: unknown.
   session_cache_hit?: boolean | null;
   cache_miss_reason?: string | null;
+  cache_source?: string | null;
+  ssd_cache_hit?: boolean | null;
   session_restore_mode?: string | null;
   session_id?: string | null;
   context_len?: number | null;
@@ -156,12 +168,41 @@ export type EvictionEntry = {
   when_s: number;
 };
 
+// `SessionBankColdTier.stats()`, nested in the bank as `cold_tier` (and served
+// alone at /admin/cache/ssd). Only the fields the dashboard reads.
+export type ColdTierStats = {
+  enabled: boolean;
+  max_bytes?: number;
+  effective_max_bytes?: number;
+  entries?: number;
+  bytes?: number;
+  physical_bytes?: number;
+  logical_bytes?: number;
+  dedupe_ratio?: number;
+  sessions?: number;
+  entries_without_session?: number;
+  oldest_created_at_s?: number | null;
+  newest_created_at_s?: number | null;
+  never_restored_entries?: number;
+  writer_queue_depth?: number;
+  writer_backlog_bytes?: number;
+  restore_hits?: number;
+  restore_misses?: number;
+  restore_failures?: number;
+  entries_evicted?: number;
+};
+
 export type SessionBank = {
   max_entries: number;
+  max_bytes?: number | null;
+  effective_max_bytes?: number | null;
+  idle_ttl_s?: number | null;
+  entries?: number;
   total_nbytes: number;
   last_miss_reason: string | null;
   prefixes: SessionBankPrefix[];
   eviction_log: EvictionEntry[];
+  cold_tier?: ColdTierStats;
 };
 
 export type SessionRow = {
@@ -361,4 +402,45 @@ export type PrefillRow = {
 export type PrefillHistoryPayload = {
   capacity: number;
   history: PrefillRow[];
+};
+
+// GET /v1/mtplx/launch: how the server process was started, captured once
+// at startup. Secret values arrive as "•••".
+export type LaunchEnvSource = "launch" | "profile" | "both" | "flag";
+
+export type LaunchEnvRow = {
+  name: string;
+  value: string;
+  source: LaunchEnvSource;
+  // Only for source "both": what was passed at launch and what the profile
+  // asked for; `value` is whichever won.
+  launch_value?: string;
+  profile_value?: string;
+};
+
+export type LaunchFixedSettings = {
+  profile: string | null;
+  model: string | null;
+  model_id: string | null;
+  host: string | null;
+  port: number | null;
+  generation_mode: string | null;
+  load_mtp: boolean;
+  api_key_required: boolean;
+  context_window: number | null;
+};
+
+export type LaunchRestart = {
+  env: { name: string; value: string }[];
+  argv: string[];
+};
+
+export type LaunchInfo = {
+  ok: boolean;
+  reason?: string;
+  launcher?: string;
+  fixed?: LaunchFixedSettings;
+  argv?: string[];
+  env?: LaunchEnvRow[];
+  restart?: LaunchRestart;
 };

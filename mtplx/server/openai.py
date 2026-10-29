@@ -223,6 +223,12 @@ from mtplx.server.flight_recorder import FlightRecorder, resolve_flight_recorder
 from mtplx.server.stream_rate import PhaseRateMeter, decode_phase_for_fields
 from mtplx import thermal_pressure as _thermal_pressure
 from mtplx.server.served_window import served_execution_window
+from mtplx.server.launch_info import (
+    SERVE_LAUNCH_ENV,
+    LaunchCapture,
+    build_launch_info,
+    capture_launch,
+)
 from mtplx.prefill_plan import publishable_reread
 
 # Inert fallback so stubbed states (tests) hit no-op recorder methods instead
@@ -3478,6 +3484,9 @@ class ServerState:
         _startup_line(f"[4/6] Preparing {runtime_label} runtime")
         if args.generation_mode == "mtp" and not args.load_mtp:
             raise ValueError("--generation-mode mtp requires --load-mtp")
+        # How the operator started the process, before the profile writes
+        # os.environ; main() captures it even earlier, before parse_args.
+        args._launch_capture = _launch_capture(args)
         if args.diagnostic_env_ablation:
             self.profile_env_status = profile_env_status(self.profile.name)
             self.fast_path_env_status = _fast_path_env_status()
@@ -4098,6 +4107,21 @@ class ServerState:
             else None
         )
         self.warmup_status = _run_startup_warmup(self)
+        # Captured once, after every env write of startup (profile, flags):
+        # the dashboard's Settings tab reads it from /v1/mtplx/launch.
+        self.launch_info = build_launch_info(
+            args._launch_capture,
+            environ=os.environ,
+            profile_env={
+                **(
+                    {}
+                    if args.diagnostic_env_ablation
+                    else self.profile.env_dict()
+                ),
+                **getattr(self, "runtime_env_overrides", {}),
+            },
+            fixed=_launch_fixed_settings(args),
+        )
 
     def _smart_fan_activity_probe(self) -> bool:
         """True while any model work is executing, queued, or recently active.
@@ -5180,6 +5204,12 @@ class _BatchedARGenerationService:
                                 "prefill_compute_tok_s": prefill_tok_s,
                                 "prefill_wall_tok_s": prefill_tok_s,
                                 "cache_hit": bool(job.session_cache_hit),
+                                "cache_source": job.cache_source,
+                                "cache_miss_reason": job.cache_miss_reason,
+                                "ssd_cache_hit": bool(job.ssd_cache_hit),
+                                "ssd_cached_tokens": int(job.ssd_cached_tokens),
+                                "ssd_restore_s": float(job.ssd_restore_s),
+                                "ssd_suffix_tokens": int(job.ssd_suffix_tokens),
                                 "scheduler_lane": "ar_batch",
                                 "request_id": job.request_id,
                             }
@@ -16967,6 +16997,10 @@ def _record_request_metrics(state: "ServerState", record: dict[str, Any]) -> Non
         reread = rereads.pop(str(record["request_id"]))
         if reread is not None:
             record.setdefault("reread", reread)
+        # Only a cancellation reads its prefill outcome; let it go here.
+        outcomes = getattr(state.dashboard, "prefill_outcomes", None)
+        if outcomes is not None:
+            outcomes.pop(str(record["request_id"]))
     safe = _json_safe(record)
     # Warmup generations (startup pass and the idle background ladder) are
     # not user requests: keep them out of the RAM ring that feeds the
@@ -18515,6 +18549,43 @@ def _dashboard_record_completion(
         _safe_stdout_print(f"[dashboard] record_completion suppressed error: {exc!r}")
 
 
+def _prefill_cache_outcome(payload: Mapping[str, Any]) -> dict[str, Any] | None:
+    """The cache outcome a completed prefill reports, in the request-log
+    field names and with the defaults ``_metrics_envelope`` applies, or None
+    when the event says nothing about the cache.
+
+    A request cancelled during decode never reaches its stats; its receipt
+    takes these fields instead.
+    """
+
+    hit = payload.get("session_cache_hit", payload.get("cache_hit"))
+    if hit is None:
+        return None
+    hit = bool(hit)
+    prompt_tokens = int(payload.get("tokens_total") or 0)
+    cached_tokens = int(payload.get("cached_tokens") or 0)
+    new_prefill_tokens = payload.get("new_prefill_tokens")
+    if new_prefill_tokens is None:
+        new_prefill_tokens = prompt_tokens - cached_tokens
+    outcome: dict[str, Any] = {
+        "session_cache_hit": hit,
+        "cached_tokens": cached_tokens,
+        "new_prefill_tokens": max(0, int(new_prefill_tokens)),
+        "cache_source": str(payload.get("cache_source") or ("ram" if hit else "none")),
+        "cache_miss_reason": None if hit else payload.get("cache_miss_reason"),
+        "ssd_cache_hit": bool(payload.get("ssd_cache_hit") or False),
+        "ssd_cached_tokens": int(payload.get("ssd_cached_tokens") or 0),
+        "ssd_restore_s": float(payload.get("ssd_restore_s") or 0.0),
+        "ssd_suffix_tokens": int(payload.get("ssd_suffix_tokens") or 0),
+    }
+    if isinstance(payload.get("prompt_eval_time_s"), (int, float)):
+        outcome["prompt_eval_time_s"] = float(payload["prompt_eval_time_s"])
+    served = payload.get("session_restore_served")
+    if isinstance(served, Mapping) and served:
+        outcome["session_restore_served"] = dict(served)
+    return outcome
+
+
 def _dashboard_publish_prefill(
     state: "ServerState",
     *,
@@ -18594,6 +18665,11 @@ def _dashboard_publish_prefill(
         # for the SSE stream.
         if enriched.get("phase") == "completed":
             dashboard.in_flight.update_prefill(request_id, None)
+            outcome = _prefill_cache_outcome(enriched)
+            if outcome is not None:
+                dashboard.prefill_outcomes.put(request_id, outcome)
+            # Kept for the receipt only; the live view has no use for it.
+            enriched.pop("session_restore_served", None)
         else:
             dashboard.in_flight.update_prefill(request_id, enriched)
         dashboard.bus.publish({"kind": "prefill", "when_s": time.time(), **enriched})
@@ -18871,6 +18947,7 @@ def _mtplx_app_capabilities() -> dict[str, Any]:
         "prefill_history": "/v1/mtplx/prefill_history",
         "flight": "/v1/mtplx/flight",
         "settings": "/v1/mtplx/settings",
+        "launch": "/v1/mtplx/launch",
         "cancel": "/v1/mtplx/cancel/{request_id}",
         "dashboard": "/dashboard/",
         "app_capabilities": "/v1/mtplx/app/capabilities",
@@ -23294,9 +23371,15 @@ def _run_prefill_admission(
         width: int | None,
         lease: Mapping[str, Any] | None = None,
         source: Any | None = None,
+        restore_donor_nbytes: int = 0,
     ) -> dict[str, Any]:
         if prompt_scoring:
             return prompt_scoring_growth(state, prompt_tokens=prompt_tokens, width=width)
+        planned_reused = reused
+        if restore_donor_nbytes:
+            # A failed SSD read can fall back to a shorter RAM prefix: price
+            # the whole prompt plus the decoded donor, without lease relief.
+            reused, copies, source_layout, lease, source = 0, True, None, None, None
         miss = max(0, prompt_tokens - min(prompt_tokens, max(0, int(reused))))
         at_width = geometry_at(width)
         forward = _prefill_forward_bill(
@@ -23349,6 +23432,13 @@ def _run_prefill_admission(
         model["scratch_rows"] = rows
         model["prefill_chunk_tokens"] = width
         model["chunk_bytes"] = int(forward["chunk_bytes"])
+        model["restore_donor_bytes"] = int(restore_donor_nbytes)
+        if restore_donor_nbytes:
+            model["planned_reused_tokens"] = int(planned_reused)
+            model["restore_priced_as_full_miss"] = True
+            for peak in ("prefill_end_bytes", "repage_bytes", "decode_start_bytes"):
+                model[peak] += int(restore_donor_nbytes)
+            model["growth_bytes"] += int(restore_donor_nbytes)
         return model
 
     def settle(model: Mapping[str, Any]) -> None:
@@ -23384,8 +23474,8 @@ def _run_prefill_admission(
 
     # Cheap worst case first: nothing reused, the whole prompt new, a copy
     # banked, at the request's own width. It bounds every split of this
-    # prompt, so when it clears both lines the request is admitted without
-    # probing the bank.
+    # prompt when its donor is already resident. A readable SSD tier also
+    # needs the decoded donor, so that lane must ask the bank first.
     scheduler = getattr(state, "model_scheduler", None)
     native_extend = getattr(session_bank, "native_lease_can_extend", None)
     # This critical section remains on the model owner through the real restore;
@@ -23396,7 +23486,9 @@ def _run_prefill_admission(
         and state.lock.locked()
     )
     cheap = growth(0, True, None, widths[0])
-    if shed_deficit(now, cheap) <= 0 and not serialized_native:
+    cold_tier = getattr(session_bank, "cold_tier", None)
+    cold_reads = cold_tier is not None and getattr(cold_tier, "mode", None) not in {"off", "write-only"}
+    if shed_deficit(now, cheap) <= 0 and not serialized_native and not cold_reads:
         settle(cheap)
         return None
 
@@ -23413,6 +23505,7 @@ def _run_prefill_admission(
         reused_tokens = 0
         reused_mode = "none"
         source_entry = None
+        restore_donor_nbytes = 0
         keys: set[tuple[int, ...]] = set()
         if session_bank is not None and callable(plan_fn):
             # The bank answers with the restore's own lanes and gates (exact
@@ -23421,7 +23514,10 @@ def _run_prefill_admission(
             # protects. An image prompt asks in its content-keyed view,
             # partial matches included, as its restore does.
             try:
-                plan = plan_fn(probe_ids, near_prefix=True, **identity)
+                plan = plan_fn(
+                    probe_ids, near_prefix=True, include_cold=True,
+                    required_boundary=required_boundary, **identity,
+                )
             except Exception:
                 plan = None
             if plan:
@@ -23430,6 +23526,7 @@ def _run_prefill_admission(
                 reused_tokens = int(plan["reuse_tokens"])
                 reused_mode = str(plan.get("mode") or "exact")
                 source_entry = plan.get("source")
+                restore_donor_nbytes = int(plan.get("restore_donor_nbytes") or 0)
         elif session_bank is not None:
             try:
                 entry = session_bank.longest_prefix(probe_ids)
@@ -23490,6 +23587,7 @@ def _run_prefill_admission(
             "reused_tokens": int(reused_tokens),
             "reused_mode": reused_mode,
             "source_entry": source_entry,
+            "restore_donor_nbytes": restore_donor_nbytes,
             "keys": keys,
             "copies": bool(copies),
             "source_layout": (
@@ -23519,6 +23617,7 @@ def _run_prefill_admission(
                 w,
                 lease=restore["lease"],
                 source=restore["source_entry"],
+                restore_donor_nbytes=restore["restore_donor_nbytes"],
             )
             for w in widths
         }
@@ -23747,6 +23846,7 @@ def _run_prefill_admission(
         if (
             restore["reused_tokens"] != before["reused_tokens"]
             or restore["copies"] != before["copies"]
+            or restore["restore_donor_nbytes"] != before["restore_donor_nbytes"]
         ):
             receipt.setdefault("restore_replanned", []).append(
                 {
@@ -23754,6 +23854,7 @@ def _run_prefill_admission(
                     "reusable_prefix_tokens": int(restore["reused_tokens"]),
                     "reusable_prefix_mode": restore["reused_mode"],
                     "restore_copies_prefix": bool(restore["copies"]),
+                    "restore_donor_bytes": int(restore["restore_donor_nbytes"]),
                 }
             )
 
@@ -26263,10 +26364,25 @@ def _record_stream_cancellation_metric(
         "server_tok_s": partial_tok_s,
         "partial_decode_tok_s": partial_tok_s,
         "partial_request_tok_s": partial_tok_s,
-        "session_cache_hit": False,
+        # Unknown until the prefill completes: None, not a miss.
+        "session_cache_hit": None,
+        "cached_tokens": None,
+        "new_prefill_tokens": None,
+        "cache_source": None,
         "cache_miss_reason": None,
+        "ttft_s": None,
     }
+    outcomes = getattr(getattr(state, "dashboard", None), "prefill_outcomes", None)
+    outcome = outcomes.pop(response_id) if outcomes is not None else None
+    if outcome is not None:
+        envelope.update(outcome)
     if token_times:
+        # As in _metrics_envelope: from the request's arrival to its first token.
+        received_s = request_observability.get("request_received_monotonic_s")
+        first_token_origin_s = (
+            float(received_s) if isinstance(received_s, (int, float)) else stream_started_s
+        )
+        envelope["ttft_s"] = max(0.0, token_times[0] - first_token_origin_s)
         envelope.update(_producer_gap_census(token_times))
         envelope["sliding_decode_tok_s_first_32"] = _token_window_rate_first(
             token_times, 32
@@ -31867,6 +31983,11 @@ def _run_generation(
                 request_observability["prefill_admission_shed"] = admission_shed
             if admission_shed is not None and admission_shed.get("refused"):
                 raise _prefill_admission_refusal(state, admission_shed)
+            if admission_pricing.get("growth"):
+                # A writer can publish a larger SSD donor after this bill.
+                trace_metadata["ssd_restore_max_bytes"] = int(
+                    admission_pricing["growth"].get("restore_donor_bytes") or 0
+                )
             if wide_prefill_rungs:
                 # The width the admission settled on after reclamation (or,
                 # when it priced nothing, the live-memory gate's answer).
@@ -36511,6 +36632,33 @@ def _set_server_reasoning_mode(state: ServerState, mode: str) -> None:
     state.args.enable_thinking = False if normalized == "off" else True
 
 
+def _launch_capture(args: argparse.Namespace) -> LaunchCapture:
+    capture = getattr(args, "_launch_capture", None)
+    if capture is None:
+        capture = capture_launch(
+            os.environ,
+            getattr(args, "_raw_args", sys.argv[1:]),
+            executable=sys.executable,
+        )
+    return capture
+
+
+def _launch_fixed_settings(args: argparse.Namespace) -> dict[str, Any]:
+    """The startup choices the Settings tab shows as fixed until restart."""
+
+    return {
+        "profile": getattr(args, "profile", None),
+        "model": getattr(args, "model", None),
+        "model_id": getattr(args, "model_id", None),
+        "host": getattr(args, "host", None),
+        "port": getattr(args, "port", None),
+        "generation_mode": getattr(args, "generation_mode", None),
+        "load_mtp": bool(getattr(args, "load_mtp", False)),
+        "api_key_required": bool(getattr(args, "api_key", None)),
+        "context_window": getattr(args, "context_window", None),
+    }
+
+
 def _server_settings_payload(state: ServerState) -> dict[str, Any]:
     reasoning = getattr(state.args, "reasoning", None)
     if reasoning not in {"auto", "on", "off"}:
@@ -37251,6 +37399,16 @@ def create_app(state: ServerState) -> FastAPI:
         if applied:
             result["applied"] = applied
         return result
+
+    @app.get("/v1/mtplx/launch")
+    def mtplx_launch() -> dict[str, Any]:
+        # Read-only and captured once at startup: the command line, the
+        # MTPLX_/MLX_/PYTHONPATH environment with each variable's source,
+        # and the settings that only change with a restart.
+        launch_info = getattr(state, "launch_info", None)
+        if launch_info is None:
+            return {"ok": False, "reason": "launch_info_unavailable"}
+        return launch_info
 
     @app.get("/v1/mtplx/snapshot")
     def mtplx_snapshot() -> dict[str, Any]:
@@ -45346,7 +45504,16 @@ def _refuse_unresolvable_retrieval_models(registry: Any) -> None:
 
 
 def main(argv: list[str] | None = None) -> None:
+    launch_capture = capture_launch(
+        os.environ,
+        list(sys.argv[1:] if argv is None else argv),
+        executable=sys.executable,
+    )
+    # The handoff from `mtplx serve` describes this process only; a worker
+    # this server spawns must not inherit it.
+    os.environ.pop(SERVE_LAUNCH_ENV, None)
     args = parse_args(argv)
+    args._launch_capture = launch_capture
     validate_server_security_args(args)
     set_stream_stall_deadline_s(getattr(args, "stream_stall_deadline_s", None))
     try:

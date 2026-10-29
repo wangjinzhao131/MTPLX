@@ -1109,6 +1109,8 @@ class SessionBankColdTier:
         draft_head_identity: str | None = None,
         policy_fingerprint: str | None = None,
         required_boundary: int | None = None,
+        required_prefix_len: int | None = None,
+        max_restore_bytes: int | None = None,
     ) -> ColdRestoreRecord | None:
         if self.mode == "off":
             self._set_last_miss("ssd_cache_off")
@@ -1134,8 +1136,11 @@ class SessionBankColdTier:
                 policy_fingerprint=policy_fingerprint,
             )
             for row in rows:
+                if required_prefix_len is not None and int(row["prefix_len"]) != required_prefix_len:
+                    continue
                 record = self._restore_row(
-                    row, tokens, started_s=started, required_boundary=required_boundary
+                    row, tokens, started_s=started, required_boundary=required_boundary,
+                    max_restore_bytes=max_restore_bytes,
                 )
                 if record is not None:
                     return record
@@ -1147,6 +1152,101 @@ class SessionBankColdTier:
         self._inc("restore_misses")
         self._set_last_miss("ssd_prefix_miss")
         return None
+
+    def exact_prefix_plan(
+        self,
+        token_ids: list[int] | tuple[int, ...],
+        *,
+        model_path: str,
+        mtp_enabled: bool,
+        hidden_variant: str | None = None,
+        template_hash: str | None = None,
+        mtp_history_policy: str | None = None,
+        draft_head_identity: str | None = None,
+        policy_fingerprint: str | None = None,
+        required_boundary: int | None = None,
+        ssd_restore_max_bytes: int | None = None,
+    ) -> dict[str, int] | None:
+        """Probe usable whole prefixes without tensor reads or lookup side effects."""
+        if self.mode in {"off", "write-only"}:
+            return None
+        if ssd_restore_max_bytes is not None and ssd_restore_max_bytes <= 0:
+            return None
+        tokens = tuple(int(token) for token in token_ids)
+        if not tokens:
+            return None
+
+        def snapshot_present(spec: Any) -> bool:
+            return isinstance(spec, dict) and all(
+                isinstance(spec.get(name), dict)
+                and spec[name].get("kind") in {"tuple", "list"}
+                and isinstance(spec[name].get("items"), list)
+                for name in ("states", "meta_states")
+            )
+
+        try:
+            rows = self._candidate_rows(
+                tokens,
+                model_path=model_path,
+                mtp_enabled=mtp_enabled,
+                hidden_variant=hidden_variant,
+                template_hash=template_hash,
+                mtp_history_policy=mtp_history_policy,
+                draft_head_identity=draft_head_identity,
+                policy_fingerprint=policy_fingerprint,
+            )
+            for row in rows:
+                try:
+                    if int(row["format_version"]) != COLD_TIER_FORMAT_VERSION:
+                        continue
+                    epoch = row["mtp_snapshot_epoch"]
+                    if epoch is not None and int(epoch) != int(row["snapshot_epoch"]):
+                        continue
+                    prefix = tuple(int(token) for token in json.loads(row["token_ids_json"]))
+                    if (
+                        not prefix or len(prefix) != int(row["prefix_len"])
+                        or tokens[:len(prefix)] != prefix
+                    ):
+                        continue
+                    payload_path = self.base_dir / row["entry_dir"] / "payload.json"
+                    spec = json.loads(payload_path.read_text(encoding="utf-8"))["payload_spec"]
+                    if not isinstance(spec, dict) or not snapshot_present(spec.get("cache_snapshot")):
+                        continue
+                    if hidden_variant is not None and any(
+                        not isinstance(spec.get(name), dict)
+                        or spec[name].get("kind") not in {"tensor", "tensor_blocks"}
+                        for name in ("logits", "hidden")
+                    ):
+                        continue
+                    if (
+                        mtp_history_policy in _COMMITTED_CACHE_POLICIES
+                        and not snapshot_present(spec.get("mtp_history_snapshot"))
+                    ):
+                        continue
+                    if (
+                        required_boundary is not None
+                        and spec.get("has_recurrent", False)
+                        and 0 < required_boundary < len(prefix)
+                        and _payload_boundary_at_or_below(spec, required_boundary) != required_boundary
+                    ):
+                        continue
+                    decoded_nbytes = max(int(row["nbytes"]), int(row["logical_nbytes"]))
+                    if decoded_nbytes <= 0:
+                        continue
+                    if ssd_restore_max_bytes is not None and decoded_nbytes > ssd_restore_max_bytes:
+                        continue
+                    return {"reuse_tokens": len(prefix), "decoded_nbytes": decoded_nbytes}
+                except (OSError, ValueError, TypeError, KeyError):
+                    continue
+        except Exception as exc:
+            logger.warning(
+                "SessionBank SSD exact-prefix probe failed: %s: %s", type(exc).__name__, exc
+            )
+        return None
+
+    def exact_prefix_len(self, token_ids, **identity: Any) -> int:
+        plan = self.exact_prefix_plan(token_ids, **identity)
+        return int(plan["reuse_tokens"]) if plan is not None else 0
 
     def lookup_prefix_boundary(
         self,
@@ -1334,7 +1434,7 @@ class SessionBankColdTier:
         row_has_mtp = "mtp_full" in row_caps or row["mtp_snapshot_epoch"] is not None
         return (not row_has_mtp) or bool(dup.get("has_mtp_history"))
 
-    def _manifest_stats_row(self) -> tuple[int, int, int, int, int]:
+    def _manifest_stats_row(self) -> tuple[Any, ...]:
         """The stats() aggregate, opening the manifest only when it changed.
 
         Before 2.8.2 every stats() call — i.e. every /health and dashboard
@@ -1364,7 +1464,11 @@ class SessionBankColdTier:
                 "COALESCE(SUM(CASE WHEN physical_nbytes > 0 "
                 "THEN physical_nbytes ELSE nbytes END), 0), "
                 "COALESCE(SUM(deduped_nbytes), 0), "
-                "COALESCE(MAX(max(nbytes, logical_nbytes)), 0) FROM entries"
+                "COALESCE(MAX(max(nbytes, logical_nbytes)), 0), "
+                "COUNT(DISTINCT session_id), "
+                "COALESCE(SUM(CASE WHEN session_id IS NULL THEN 1 ELSE 0 END), 0), "
+                "MIN(created_at_s), MAX(created_at_s), "
+                "COALESCE(SUM(CASE WHEN hits = 0 THEN 1 ELSE 0 END), 0) FROM entries"
             ).fetchone()
         row = (
             int(fetched[0]),
@@ -1372,6 +1476,11 @@ class SessionBankColdTier:
             int(fetched[2]),
             int(fetched[3]),
             int(fetched[4]),
+            int(fetched[5]),
+            int(fetched[6]),
+            None if fetched[7] is None else float(fetched[7]),
+            None if fetched[8] is None else float(fetched[8]),
+            int(fetched[9]),
         )
         with self._manifest_stats_lock:
             self._manifest_stats_cache = {
@@ -1410,6 +1519,15 @@ class SessionBankColdTier:
             stats["deduped_bytes"] = int(row[3])
             logical = max(1, int(row[1]))
             stats["dedupe_ratio"] = max(0.0, float(row[3]) / float(logical))
+            # What the store holds, for the dashboard's cache overview: how
+            # many conversations the snapshots belong to (rows written
+            # without a session id are counted apart), how old the oldest
+            # and newest snapshot are, and how many were never restored.
+            stats["sessions"] = int(row[5])
+            stats["entries_without_session"] = int(row[6])
+            stats["oldest_created_at_s"] = row[7]
+            stats["newest_created_at_s"] = row[8]
+            stats["never_restored_entries"] = int(row[9])
             usage = self._managed_disk_usage()
             managed_file_bytes = int(usage.get("managed_file_bytes", 0))
             managed_disk_bytes = int(usage.get("managed_disk_bytes", 0))
@@ -2706,8 +2824,13 @@ class SessionBankColdTier:
         include_gdn_boundaries: bool = False,
         prefix_restore_tokens: int | None = None,
         required_boundary: int | None = None,
+        max_restore_bytes: int | None = None,
     ) -> ColdRestoreRecord | None:
         metadata = dict(row)
+        if max_restore_bytes is not None and max(
+            int(metadata["nbytes"]), int(metadata["logical_nbytes"])
+        ) > max_restore_bytes:
+            return None
         token_ids = tuple(int(token) for token in json.loads(str(metadata["token_ids_json"])))
         if require_exact_prefix and lookup_tokens[: len(token_ids)] != token_ids:
             return None
